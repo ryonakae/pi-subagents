@@ -111,7 +111,7 @@ The same predicate silently scopes the events. **Every lifecycle event is top-le
 
 When a background agent finishes, pi-subagents sends the user a completion notification. If you have already shown the model that result yourself, that notification arrives on top of an answer that was already given, and it costs the parent a turn to dismiss. `subagents:rpc:consume` is how you say you have handled it — the bus-side half of what `get_subagent_result` does when it returns a result.
 
-**When you send it decides whether it works.** The timeline:
+**When you send it decides whether it works.** In TUI and RPC sessions, the timeline is:
 
 1. The agent settles and `subagents:completed` is emitted — `src/index.ts:581`.
 2. Eleven lines later, at `src/index.ts:592`, the code checks `record.resultConsumed` and decides whether to notify at all.
@@ -120,8 +120,13 @@ When a background agent finishes, pi-subagents sends the user a completion notif
 | When you consume | What happens |
 |---|---|
 | Synchronously, inside your `subagents:completed` handler | The notification is never scheduled. This is the clean path |
-| After an `await`, within 200 ms | Still suppressed. The nudge is held for `NUDGE_HOLD_MS` (`src/index.ts:451`), `consume` cancels the pending timer (`:819`), and there is a re-check at send time (`:474`) |
-| After 200 ms | Too late. The follow-up has fired with `triggerTurn: true` and cost the parent a turn |
+| After an `await`, within 200 ms | Still suppressed. Consumption cancels the held notification, and delivery re-checks `resultConsumed` |
+| After 200 ms, while the parent is busy | Still suppressed. The notification remains inside the extension until `agent_settled`; consumption before delivery prevents it from reaching Pi's follow-up queue |
+| After delivery to Pi | Too late. A follow-up already handed to Pi cannot be withdrawn |
+
+The fork defers delivery, not the lifecycle event or the result itself. `get_subagent_result` can still retrieve a completed result while the parent runs. Individual and grouped notifications use the same hold: a partially consumed group contains only unconsumed results, and a fully consumed group is discarded. Idle parents keep the existing 200 ms hold. Shutdown drops undelivered agent notifications.
+
+Print (`pi -p`) and JSON hosts retain upstream delivery timing: after 200 ms a completion may already be in Pi's non-retractable follow-up queue, even if the parent is still busy. The fork does not defer these hosts until `agent_settled`, because Pi 0.85.0 can exit before the resulting notification response completes. Consume synchronously or within the hold window to suppress their notifications.
 
 Fire-and-forget is the intended use: the reply carries nothing to act on, and the channel sits outside the `subagents:rpc:ping` version handshake on purpose (`src/cross-extension-rpc.ts:190`), so you can send it unconditionally and an older pi-subagents with no handler simply keeps notifying.
 

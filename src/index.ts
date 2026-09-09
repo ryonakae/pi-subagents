@@ -31,6 +31,7 @@ import { runMentionClone } from "./mention-clone.js";
 import { describeModel, type ModelRegistry, resolveModel } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
+import { DEFAULT_HOLD_MS, NudgeQueue } from "./nudge-queue.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
@@ -443,30 +444,38 @@ export default function (pi: ExtensionAPI) {
     persistSettings(ctx, `Viewer markdown set to ${mode}`);
   }
   const pendingUsage = new PendingUsagePool();
+  // Bound on session_start; read by notification delivery and RPC spawn.
+  let currentCtx: ExtensionContext | undefined;
 
   // ---- Cancellable pending notifications ----
-  // Holds notifications briefly so get_subagent_result can cancel them
-  // before they reach pi.sendMessage (fire-and-forget).
-  const pendingNudges = new Map<string, ReturnType<typeof setTimeout>>();
-  const NUDGE_HOLD_MS = 200;
+  // Agent notifications that come due mid-run stay retractable here until the
+  // parent settles. Workflow notifications retain their existing independent
+  // path and timing.
+  const NUDGE_HOLD_MS = DEFAULT_HOLD_MS;
   // A queued result wait must observe completion before its held notification
   // can fire, so successful waits can still suppress that redundant nudge.
   const QUEUE_WAIT_POLL_MS = Math.floor(NUDGE_HOLD_MS / 4);
+  const agentNudges = new NudgeQueue(
+    () => currentCtx?.mode === "print" || currentCtx?.mode === "json" || (currentCtx?.isIdle() ?? true),
+    NUDGE_HOLD_MS,
+  );
+  const pendingWorkflowNudges = new Map<string, ReturnType<typeof setTimeout>>();
 
-  function scheduleNudge(key: string, send: () => void, delay = NUDGE_HOLD_MS) {
-    cancelNudge(key);
-    pendingNudges.set(key, setTimeout(() => {
-      pendingNudges.delete(key);
-      try { send(); } catch { /* ignore stale completion side-effect errors */ }
-    }, delay));
+  function scheduleAgentNudge(key: string, send: () => void, delay = NUDGE_HOLD_MS) {
+    agentNudges.schedule(key, send, delay);
   }
 
-  function cancelNudge(key: string) {
-    const timer = pendingNudges.get(key);
-    if (timer != null) {
-      clearTimeout(timer);
-      pendingNudges.delete(key);
-    }
+  function cancelAgentNudge(key: string) {
+    agentNudges.cancel(key);
+  }
+
+  function scheduleWorkflowNudge(key: string, send: () => void, delay = NUDGE_HOLD_MS) {
+    const pending = pendingWorkflowNudges.get(key);
+    if (pending !== undefined) clearTimeout(pending);
+    pendingWorkflowNudges.set(key, setTimeout(() => {
+      pendingWorkflowNudges.delete(key);
+      try { send(); } catch { /* ignore stale completion side-effect errors */ }
+    }, delay));
   }
 
   // ---- Individual nudge helper (async join mode) ----
@@ -488,7 +497,7 @@ export default function (pi: ExtensionAPI) {
     agentActivity.delete(record.id);
     widget.markFinished(record.id);
     fleet.onAgentFinished(record.id);
-    scheduleNudge(record.id, () => emitIndividualNudge(record));
+    scheduleAgentNudge(record.id, () => emitIndividualNudge(record));
     widget.update();
   }
 
@@ -498,7 +507,7 @@ export default function (pi: ExtensionAPI) {
       for (const r of records) { agentActivity.delete(r.id); widget.markFinished(r.id); fleet.onAgentFinished(r.id); }
 
       const groupKey = `group:${records.map(r => r.id).join(",")}`;
-      scheduleNudge(groupKey, () => {
+      scheduleAgentNudge(groupKey, () => {
         // Re-check at send time
         const unconsumed = records.filter(r => !r.resultConsumed);
         if (unconsumed.length === 0) { widget.update(); return; }
@@ -750,7 +759,6 @@ export default function (pi: ExtensionAPI) {
   }
 
   // --- Cross-extension RPC via pi.events ---
-  let currentCtx: ExtensionContext | undefined;
   // RPC handlers + the `subagents:ready` broadcast are wired on `session_start`
   // (a bound lifecycle event), not at factory time. pi runs every extension
   // factory before the `extensions:` filter and only fires lifecycle events for
@@ -816,7 +824,7 @@ export default function (pi: ExtensionAPI) {
             if (!record || record.parentAgentId) return false;
             if (record.status === "running" || record.status === "queued") return false;
             record.resultConsumed = true;
-            cancelNudge(record.id);
+            cancelAgentNudge(record.id);
             return true;
           },
         },
@@ -1087,6 +1095,13 @@ export default function (pi: ExtensionAPI) {
     return { action: "handled" };
   });
 
+  // `agent_end` and `turn_end` may still be followed by retry, compaction, or
+  // another tool-calling turn. Only a fully settled parent may receive held
+  // follow-ups without making them non-retractable in Pi's queue.
+  pi.on("agent_settled", () => {
+    agentNudges.flush();
+  });
+
   pi.on("session_before_switch", () => {
     manager.clearCompleted(true);
     scheduler.stop();
@@ -1112,8 +1127,10 @@ export default function (pi: ExtensionAPI) {
     for (const task of workflowTasks.values()) task.abortController.abort();
     workflowTasks.clear();
     manager.abortAll();
-    for (const timer of pendingNudges.values()) clearTimeout(timer);
-    pendingNudges.clear();
+    groupJoin.dispose();
+    agentNudges.dispose();
+    for (const timer of pendingWorkflowNudges.values()) clearTimeout(timer);
+    pendingWorkflowNudges.clear();
     fleet.dispose();
     // Awaited: it emits `session_shutdown` into every retained child session so
     // extensions bound there can release what they armed in `session_start` (#242).
@@ -2373,15 +2390,15 @@ Terse command-style prompts produce shallow, generic work.
   }
 
   /**
-   * Hand a finished run back to the model through the SAME channel a background
-   * agent uses — held briefly by `scheduleNudge`, delivered as a follow-up that
-   * triggers a turn, rendered by the existing `subagent-notification` renderer.
+   * Hand a finished run back to the model through its independent 200ms queue,
+   * delivered as a follow-up that triggers a turn and rendered by the existing
+   * `subagent-notification` renderer.
    */
   function notifyWorkflowFinished(task: WorkflowTask) {
     widget.update();
     fleet.update();
     const result = workflowResultText(task);
-    scheduleNudge(task.id, () => {
+    scheduleWorkflowNudge(task.id, () => {
       pi.sendMessage<NotificationDetails>({
         customType: "subagent-notification",
         content: formatWorkflowNotification(task),
@@ -2801,7 +2818,7 @@ Terse command-style prompts produce shallow, generic work.
       // Mark result as consumed — suppresses the completion notification
       if (record.status !== "running" && record.status !== "queued") {
         record.resultConsumed = true;
-        cancelNudge(params.agent_id);
+        cancelAgentNudge(record.id);
       }
 
       // Verbose: include full conversation

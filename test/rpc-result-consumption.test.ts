@@ -35,6 +35,7 @@ const PAST_THE_HOLD_MS = 400;
  * these tests are about what a second extension sees and sends on it.
  */
 function makePi() {
+  const tools = new Map<string, any>();
   const lifecycle = new Map<string, any>();
   const handlers = new Map<string, ((data: unknown) => void)[]>();
   const bus = {
@@ -49,7 +50,7 @@ function makePi() {
   const pi = {
     registerMessageRenderer: vi.fn(),
     registerEntryRenderer: vi.fn(),
-    registerTool: vi.fn(),
+    registerTool: vi.fn((tool: any) => tools.set(tool.name, tool)),
     registerCommand: vi.fn(),
     registerFlag: vi.fn(),
     getFlag: vi.fn(),
@@ -60,11 +61,12 @@ function makePi() {
     appendEntry: vi.fn(),
     sendMessage: vi.fn(),
   } as any;
-  return { pi, lifecycle, bus };
+  return { pi, tools, lifecycle, bus };
 }
 
-function ctx() {
+function ctx(overrides: Record<string, unknown> = {}) {
   return {
+    mode: "rpc",
     hasUI: false,
     ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn(), addAutocompleteProvider: vi.fn() },
     cwd: process.cwd(),
@@ -72,6 +74,8 @@ function ctx() {
     modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
     sessionManager: { getSessionId: vi.fn(() => "s1"), getBranch: vi.fn(() => []) },
     getSystemPrompt: vi.fn(() => "parent"),
+    isIdle: () => true,
+    ...overrides,
   } as any;
 }
 
@@ -97,7 +101,7 @@ describe("subagents:rpc:consume", () => {
     mkdirSync(join(tmpDir, ".pi"), { recursive: true });
     writeFileSync(
       join(tmpDir, ".pi", "subagents.json"),
-      JSON.stringify({ schedulingEnabled: false, outputTranscript: false }),
+      JSON.stringify({ schedulingEnabled: false, outputTranscript: false, defaultJoinMode: "async" }),
     );
     process.chdir(tmpDir);
   });
@@ -117,10 +121,10 @@ describe("subagents:rpc:consume", () => {
   });
 
   /** Boot the real extension with its RPC handlers bound, as session_start does. */
-  async function boot() {
+  async function boot(ctxOverrides?: Record<string, unknown>) {
     const booted = makePi();
     subagentsExtension(booted.pi);
-    await booted.lifecycle.get("session_start")({}, ctx());
+    await booted.lifecycle.get("session_start")({}, ctx(ctxOverrides));
     shutdown = () => booted.lifecycle.get("session_shutdown")();
     return booted;
   }
@@ -138,6 +142,217 @@ describe("subagents:rpc:consume", () => {
     await vi.waitFor(() => expect(id).toBeTruthy());
     return id;
   }
+
+  /** Spawn through the registered Agent tool and return its public result id. */
+  async function spawnOverTool(tools: Map<string, any>, toolCallId: string, name?: string): Promise<string> {
+    const started = await tools.get("Agent").execute(
+      toolCallId,
+      {
+        prompt: "go",
+        description: toolCallId,
+        name,
+        subagent_type: "general-purpose",
+        run_in_background: true,
+      },
+      undefined,
+      undefined,
+      ctx(),
+    );
+    const id = String(started.content[0].text).match(/Agent ID: (\S+)/)?.[1];
+    expect(id).toBeTruthy();
+    return id as string;
+  }
+
+  /** Keep each mocked child running until its resolver is called. */
+  function deferredRuns(): Array<() => void> {
+    const resolvers: Array<() => void> = [];
+    vi.mocked(runAgent).mockImplementation(
+      () => new Promise((resolve) => {
+        const index = resolvers.length + 1;
+        resolvers.push(() => resolve({ responseText: `GROUP_RESULT_${index}` } as any));
+      }) as any,
+    );
+    return resolvers;
+  }
+
+  it.each(["print", "json"])("delivers after the hold in busy %s mode", async (mode) => {
+    vi.mocked(runAgent).mockResolvedValue({ responseText: "ONE_SHOT_AGENT_OK" } as any);
+    const { pi, bus } = await boot({ mode, isIdle: () => false });
+
+    await spawnOverRpc(bus, `req-spawn-${mode}`);
+    await new Promise(r => setTimeout(r, PAST_THE_HOLD_MS));
+
+    expect(notifications(pi)).toHaveLength(1);
+  });
+
+  it("suppresses a tool-spawned notification consumed after the hold while the parent is busy", async () => {
+    vi.mocked(runAgent).mockResolvedValue({ responseText: "TOOL_AGENT_OK" } as any);
+    let idle = false;
+    const { pi, tools, lifecycle } = await boot({ isIdle: () => idle });
+
+    const id = await spawnOverTool(tools, "tc-tool-spawn");
+
+    await new Promise(r => setTimeout(r, PAST_THE_HOLD_MS));
+    const result = await tools.get("get_subagent_result").execute(
+      "tc-tool-result",
+      { agent_id: id },
+      undefined,
+      undefined,
+      ctx(),
+    );
+    expect(String(result.content[0].text)).toContain("TOOL_AGENT_OK");
+
+    idle = true;
+    await lifecycle.get("agent_settled")?.();
+    expect(notifications(pi)).toEqual([]);
+  });
+
+  it("suppresses an RPC notification consumed after the hold while the parent is busy", async () => {
+    vi.mocked(runAgent).mockResolvedValue({ responseText: "RPC_AGENT_OK" } as any);
+    let idle = false;
+    const { pi, bus, lifecycle } = await boot({ isIdle: () => idle });
+
+    const id = await spawnOverRpc(bus, "req-spawn-delayed-consume");
+    await new Promise(r => setTimeout(r, PAST_THE_HOLD_MS));
+    expect(notifications(pi)).toEqual([]);
+
+    bus.emit("subagents:rpc:consume", { requestId: "req-consume-delayed", agentId: id });
+    idle = true;
+    await lifecycle.get("agent_settled")?.();
+    expect(notifications(pi)).toEqual([]);
+  });
+
+  it("delivers an unconsumed held notification exactly once at agent_settled", async () => {
+    vi.mocked(runAgent).mockResolvedValue({ responseText: "UNCONSUMED_AGENT_OK" } as any);
+    let idle = false;
+    const { pi, bus, lifecycle } = await boot({ isIdle: () => idle });
+
+    await spawnOverRpc(bus, "req-spawn-unconsumed");
+    await new Promise(r => setTimeout(r, PAST_THE_HOLD_MS));
+    expect(notifications(pi)).toEqual([]);
+    expect(lifecycle.has("agent_end")).toBe(false);
+    expect(lifecycle.has("turn_end")).toBe(false);
+
+    idle = true;
+    await lifecycle.get("agent_settled")?.();
+    await lifecycle.get("agent_settled")?.();
+    expect(notifications(pi)).toHaveLength(1);
+  });
+
+  it("cancels an idle-parent notification inside the hold window", async () => {
+    vi.mocked(runAgent).mockResolvedValue({ responseText: "IDLE_AGENT_OK" } as any);
+    const { pi, bus } = await boot();
+
+    const id = await spawnOverRpc(bus, "req-spawn-idle-cancel");
+    await new Promise(r => setTimeout(r, 50));
+    bus.emit("subagents:rpc:consume", { requestId: "req-consume-idle", agentId: id });
+    await new Promise(r => setTimeout(r, PAST_THE_HOLD_MS));
+
+    expect(notifications(pi)).toEqual([]);
+  });
+
+  it("cancels by the canonical record id when a plain alias consumes the result", async () => {
+    vi.mocked(runAgent).mockResolvedValue({ responseText: "ALIASED_AGENT_OK" } as any);
+    let idle = false;
+    const { pi, tools, lifecycle } = await boot({ isIdle: () => idle });
+
+    const id = await spawnOverTool(tools, "tc-alias-spawn", "smoke-child");
+    await new Promise(r => setTimeout(r, PAST_THE_HOLD_MS));
+    await tools.get("get_subagent_result").execute(
+      "tc-alias-result",
+      { agent_id: "smoke-child" },
+      undefined,
+      undefined,
+      ctx(),
+    );
+
+    // A later resume un-consumes the reused record. The old completion send
+    // must already be gone rather than relying only on its send-time check.
+    const registry = (globalThis as any)[Symbol.for("pi-subagents:manager")];
+    registry.getRecord(id).resultConsumed = false;
+    idle = true;
+    await lifecycle.get("agent_settled")?.();
+    expect(notifications(pi)).toEqual([]);
+  });
+
+  it("discards held notifications on shutdown", async () => {
+    vi.mocked(runAgent).mockResolvedValue({ responseText: "SHUTDOWN_AGENT_OK" } as any);
+    let idle = false;
+    const { pi, bus, lifecycle } = await boot({ isIdle: () => idle });
+
+    await spawnOverRpc(bus, "req-spawn-shutdown");
+    await new Promise(r => setTimeout(r, PAST_THE_HOLD_MS));
+    await shutdown?.();
+    shutdown = undefined;
+
+    idle = true;
+    await lifecycle.get("agent_settled")?.();
+    expect(notifications(pi)).toEqual([]);
+  });
+
+  it("filters consumed members from a held group notification", async () => {
+    writeFileSync(
+      join(tmpDir, ".pi", "subagents.json"),
+      JSON.stringify({ schedulingEnabled: false, outputTranscript: false, defaultJoinMode: "group" }),
+    );
+    const resolvers = deferredRuns();
+    let idle = false;
+    const { pi, tools, lifecycle } = await boot({ isIdle: () => idle });
+
+    const [first, second] = await Promise.all([
+      spawnOverTool(tools, "tc-group-first"),
+      spawnOverTool(tools, "tc-group-second"),
+    ]);
+    await new Promise(r => setTimeout(r, 150));
+    for (const resolve of resolvers) resolve();
+    await new Promise(r => setTimeout(r, PAST_THE_HOLD_MS));
+
+    await tools.get("get_subagent_result").execute(
+      "tc-group-consume-first",
+      { agent_id: first },
+      undefined,
+      undefined,
+      ctx(),
+    );
+    idle = true;
+    await lifecycle.get("agent_settled")?.();
+
+    const sent = notifications(pi);
+    expect(sent).toHaveLength(1);
+    expect(JSON.stringify(sent[0])).not.toContain(first);
+    expect(JSON.stringify(sent[0])).toContain(second);
+  });
+
+  it("drops a held group notification when every member was consumed", async () => {
+    writeFileSync(
+      join(tmpDir, ".pi", "subagents.json"),
+      JSON.stringify({ schedulingEnabled: false, outputTranscript: false, defaultJoinMode: "group" }),
+    );
+    const resolvers = deferredRuns();
+    let idle = false;
+    const { pi, tools, lifecycle } = await boot({ isIdle: () => idle });
+
+    const ids = await Promise.all([
+      spawnOverTool(tools, "tc-group-all-first"),
+      spawnOverTool(tools, "tc-group-all-second"),
+    ]);
+    await new Promise(r => setTimeout(r, 150));
+    for (const resolve of resolvers) resolve();
+    await new Promise(r => setTimeout(r, PAST_THE_HOLD_MS));
+
+    for (const id of ids) {
+      await tools.get("get_subagent_result").execute(
+        `tc-group-consume-${id}`,
+        { agent_id: id },
+        undefined,
+        undefined,
+        ctx(),
+      );
+    }
+    idle = true;
+    await lifecycle.get("agent_settled")?.();
+    expect(notifications(pi)).toEqual([]);
+  });
 
   it("notifies for an RPC-spawned agent nobody consumed", async () => {
     // The behaviour that makes the notification worth keeping: an unread result

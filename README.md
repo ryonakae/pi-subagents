@@ -1,4 +1,6 @@
-# @tintinweb/pi-subagents
+# pi-subagents (ryonakae fork)
+
+A focused fork of [tintinweb/pi-subagents](https://github.com/tintinweb/pi-subagents). It retains upstream's tools and workflow support while fixing completion notifications that arrive after their results have already been consumed in TUI and RPC sessions. The notification fix follows [vincelwt's PR #265](https://github.com/tintinweb/pi-subagents/pull/265).
 
 A [pi](https://pi.dev) extension that brings **Claude Code-style autonomous sub-agents and workflow orchestration** to pi. Spawn specialized agents that run in isolated sessions — each with its own tools, system prompt, model, and thinking level. Run them in the background (the default) or block on them, steer them mid-run, resume completed sessions, and define your own custom agent types. When the orchestration shouldn't be improvised, hand a deterministic JavaScript script to the `SubagentWorkflow` tool — `agent()`, `parallel()`, `pipeline()` — and scripts written for Claude Code's `Workflow` tool run here unchanged.
 
@@ -39,9 +41,14 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 
 ## Install
 
-```bash
-pi install npm:@tintinweb/pi-subagents
+Install a verified commit of this fork, replacing `COMMIT_SHA` with its full SHA:
+
+```sh
+pi remove npm:@tintinweb/pi-subagents
+pi install git:github.com/ryonakae/pi-subagents@COMMIT_SHA
 ```
+
+Do not load the upstream npm package and this fork together. The package name remains unchanged, but this fork is distributed through Git, not npm. To update, test a newer fork commit and install its SHA explicitly; the pinned reference does not follow branch updates. Start a fresh Pi session after switching.
 
 Or load directly for development:
 
@@ -73,6 +80,10 @@ Agent({
 ```
 
 Agents run in the background by default: the call returns an ID immediately and notifies you on completion, carrying a preview of the result (use `get_subagent_result` for the full text). Pass `run_in_background: false` to block until the agent finishes and get its full output inline.
+
+In TUI and RPC sessions, completion notifications stay inside the extension while the parent is busy, until Pi emits `agent_settled`. If the parent retrieves a result through `get_subagent_result` or `subagents:rpc:consume` before delivery, its notification is discarded. Unconsumed results still notify the parent; idle-parent notifications retain the existing 200 ms hold.
+
+Print (`pi -p`) and JSON modes retain upstream's 200 ms delivery even while the parent is busy. Pi 0.85.0 can shut down these single-shot hosts before a response triggered from `agent_settled` completes. The duplicate-notification limitation therefore remains in these modes. Background execution and workflow completion delivery are unchanged.
 
 ### Scheduling
 
@@ -953,6 +964,7 @@ src/
   child-context.ts    # AsyncLocalStorage flag marking work done for a child session
   abortable.ts        # Race a wait against Esc without cancelling the background child
   group-join.ts       # Group join manager: batched completion notifications with timeout
+  nudge-queue.ts      # Cancellable completion delivery held until the parent is idle
   status-note.ts      # Honest status note + salvaged partial output for non-normal outcomes
   usage.ts            # Token usage shapes, accumulators, session-stats readers
 
