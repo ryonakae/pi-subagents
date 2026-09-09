@@ -21,10 +21,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
-  return { ...actual, runAgent: vi.fn() };
+  return { ...actual, runAgent: vi.fn(), resumeAgent: vi.fn() };
 });
 
-import { runAgent } from "../src/agent-runner.js";
+import { resumeAgent, runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
 
 /** pi-subagents holds a completion notification for NUDGE_HOLD_MS (200ms). */
@@ -169,10 +169,28 @@ describe("subagents:rpc:consume", () => {
     vi.mocked(runAgent).mockImplementation(
       () => new Promise((resolve) => {
         const index = resolvers.length + 1;
-        resolvers.push(() => resolve({ responseText: `GROUP_RESULT_${index}` } as any));
+        const session = { messages: [], subscribe: vi.fn(() => vi.fn()), dispose: vi.fn() };
+        resolvers.push(() => resolve({ responseText: `GROUP_RESULT_${index}`, session } as any));
       }) as any,
     );
     return resolvers;
+  }
+
+  /** Resume a completed record through the registered Agent tool. */
+  async function resumeOverTool(tools: Map<string, any>, id: string, toolCallId: string): Promise<void> {
+    await tools.get("Agent").execute(
+      toolCallId,
+      {
+        prompt: "continue",
+        description: toolCallId,
+        subagent_type: "general-purpose",
+        resume: id,
+        run_in_background: true,
+      },
+      undefined,
+      undefined,
+      ctx(),
+    );
   }
 
   it.each(["print", "json"])("delivers after the hold in busy %s mode", async (mode) => {
@@ -352,6 +370,93 @@ describe("subagents:rpc:consume", () => {
     idle = true;
     await lifecycle.get("agent_settled")?.();
     expect(notifications(pi)).toEqual([]);
+  });
+
+  it("keeps a genuinely unconsumed group member when a consumed sibling resumes", async () => {
+    writeFileSync(
+      join(tmpDir, ".pi", "subagents.json"),
+      JSON.stringify({ schedulingEnabled: false, outputTranscript: false, defaultJoinMode: "group" }),
+    );
+    const resolvers = deferredRuns();
+    let idle = false;
+    const { pi, tools, lifecycle } = await boot({ isIdle: () => idle });
+
+    const [resumed, unread] = await Promise.all([
+      spawnOverTool(tools, "tc-group-resume-consumed"),
+      spawnOverTool(tools, "tc-group-resume-unread"),
+    ]);
+    await new Promise(r => setTimeout(r, 150));
+    for (const resolve of resolvers) resolve();
+    await new Promise(r => setTimeout(r, PAST_THE_HOLD_MS));
+
+    await tools.get("get_subagent_result").execute(
+      "tc-group-read-before-resume",
+      { agent_id: resumed },
+      undefined,
+      undefined,
+      ctx(),
+    );
+    vi.mocked(resumeAgent).mockImplementation(() => new Promise(() => {}));
+    await resumeOverTool(tools, resumed, "tc-group-resume-running");
+
+    idle = true;
+    await lifecycle.get("agent_settled")?.();
+
+    const sent = notifications(pi);
+    expect(sent).toHaveLength(1);
+    expect(JSON.stringify(sent[0])).not.toContain(resumed);
+    expect(JSON.stringify(sent[0])).toContain(unread);
+  });
+
+  it("does not resurrect a fully consumed group and still notifies for the resumed completion", async () => {
+    writeFileSync(
+      join(tmpDir, ".pi", "subagents.json"),
+      JSON.stringify({ schedulingEnabled: false, outputTranscript: false, defaultJoinMode: "group" }),
+    );
+    const resolvers = deferredRuns();
+    let idle = false;
+    const { pi, tools, lifecycle } = await boot({ isIdle: () => idle });
+
+    const ids = await Promise.all([
+      spawnOverTool(tools, "tc-group-resume-all-first"),
+      spawnOverTool(tools, "tc-group-resume-all-second"),
+    ]);
+    await new Promise(r => setTimeout(r, 150));
+    for (const resolve of resolvers) resolve();
+    await new Promise(r => setTimeout(r, PAST_THE_HOLD_MS));
+
+    for (const id of ids) {
+      await tools.get("get_subagent_result").execute(
+        `tc-group-read-before-resume-${id}`,
+        { agent_id: id },
+        undefined,
+        undefined,
+        ctx(),
+      );
+    }
+
+    let finishResume: (() => void) | undefined;
+    vi.mocked(resumeAgent).mockImplementation(
+      () => new Promise((resolve) => {
+        finishResume = () => resolve({ text: "RESUMED_RESULT", failure: undefined });
+      }),
+    );
+    await resumeOverTool(tools, ids[0], "tc-group-resume-after-all-read");
+
+    idle = true;
+    await lifecycle.get("agent_settled")?.();
+    expect(notifications(pi)).toEqual([]);
+
+    idle = false;
+    finishResume?.();
+    await vi.waitFor(() => expect(vi.mocked(resumeAgent)).toHaveResolved());
+    await new Promise(r => setTimeout(r, PAST_THE_HOLD_MS));
+    idle = true;
+    await lifecycle.get("agent_settled")?.();
+
+    const sent = notifications(pi);
+    expect(sent).toHaveLength(1);
+    expect(JSON.stringify(sent[0])).toContain("RESUMED_RESULT");
   });
 
   it("notifies for an RPC-spawned agent nobody consumed", async () => {

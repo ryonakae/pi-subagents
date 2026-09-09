@@ -507,9 +507,17 @@ export default function (pi: ExtensionAPI) {
       for (const r of records) { agentActivity.delete(r.id); widget.markFinished(r.id); fleet.onAgentFinished(r.id); }
 
       const groupKey = `group:${records.map(r => r.id).join(",")}`;
+      const completedRuns = records.map(record => ({ record, abortController: record.abortController }));
       scheduleAgentNudge(groupKey, () => {
-        // Re-check at send time
-        const unconsumed = records.filter(r => !r.resultConsumed);
+        // A resumed agent reuses and mutates its record. Keep this notification
+        // tied to the completed run that entered the group, including while a
+        // resume is queued before it receives a fresh abort controller.
+        const unconsumed = completedRuns
+          .filter(({ record, abortController }) =>
+            record.abortController === abortController
+            && record.completedAt !== undefined
+            && !record.resultConsumed)
+          .map(({ record }) => record);
         if (unconsumed.length === 0) { widget.update(); return; }
 
         const notifications = unconsumed.map(r => formatTaskNotification(r, 300, showCost)).join('\n\n');
