@@ -459,14 +459,24 @@ export default function (pi: ExtensionAPI) {
     () => currentCtx?.mode === "print" || currentCtx?.mode === "json" || (currentCtx?.isIdle() ?? true),
     NUDGE_HOLD_MS,
   );
+  const pendingGroupNudges = new Map<string, Map<string, { record: AgentRecord; abortController: AgentRecord["abortController"] }>>();
   const pendingWorkflowNudges = new Map<string, ReturnType<typeof setTimeout>>();
 
   function scheduleAgentNudge(key: string, send: () => void, delay = NUDGE_HOLD_MS) {
     agentNudges.schedule(key, send, delay);
   }
 
-  function cancelAgentNudge(key: string) {
-    agentNudges.cancel(key);
+  function cancelAgentNudge(id: string) {
+    agentNudges.cancel(id);
+    // Consumption belongs to this notification, not the mutable record: a
+    // queued resume can reset its flags without replacing its controller.
+    for (const [key, members] of pendingGroupNudges) {
+      members.delete(id);
+      if (members.size === 0) {
+        agentNudges.cancel(key);
+        pendingGroupNudges.delete(key);
+      }
+    }
   }
 
   function scheduleWorkflowNudge(key: string, send: () => void, delay = NUDGE_HOLD_MS) {
@@ -507,12 +517,14 @@ export default function (pi: ExtensionAPI) {
       for (const r of records) { agentActivity.delete(r.id); widget.markFinished(r.id); fleet.onAgentFinished(r.id); }
 
       const groupKey = `group:${records.map(r => r.id).join(",")}`;
-      const completedRuns = records.map(record => ({ record, abortController: record.abortController }));
+      const completedRuns = new Map(records.map(record => [record.id, { record, abortController: record.abortController }]));
+      pendingGroupNudges.set(groupKey, completedRuns);
       scheduleAgentNudge(groupKey, () => {
+        pendingGroupNudges.delete(groupKey);
         // A resumed agent reuses and mutates its record. Keep this notification
         // tied to the completed run that entered the group, including while a
         // resume is queued before it receives a fresh abort controller.
-        const unconsumed = completedRuns
+        const unconsumed = [...completedRuns.values()]
           .filter(({ record, abortController }) =>
             record.abortController === abortController
             && record.completedAt !== undefined
@@ -1137,6 +1149,7 @@ export default function (pi: ExtensionAPI) {
     manager.abortAll();
     groupJoin.dispose();
     agentNudges.dispose();
+    pendingGroupNudges.clear();
     for (const timer of pendingWorkflowNudges.values()) clearTimeout(timer);
     pendingWorkflowNudges.clear();
     fleet.dispose();

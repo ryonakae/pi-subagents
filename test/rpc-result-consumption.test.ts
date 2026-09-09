@@ -459,6 +459,73 @@ describe("subagents:rpc:consume", () => {
     expect(JSON.stringify(sent[0])).toContain("RESUMED_RESULT");
   });
 
+  it.each([
+    ["tool", 0, false],
+    ["tool", 0, true],
+    ["tool", PAST_THE_HOLD_MS, false],
+    ["tool", PAST_THE_HOLD_MS, true],
+    ["rpc", 0, false],
+    ["rpc", 0, true],
+    ["rpc", PAST_THE_HOLD_MS, false],
+    ["rpc", PAST_THE_HOLD_MS, true],
+  ] as const)("does not resurrect a consumed group after a queued resume is stopped over RPC (consume=%s, delay=%s, unread sibling=%s)", async (consumeVia, consumeDelay, keepSibling) => {
+    writeFileSync(
+      join(tmpDir, ".pi", "subagents.json"),
+      JSON.stringify({ schedulingEnabled: false, outputTranscript: false, defaultJoinMode: "group", maxConcurrent: 2 }),
+    );
+    const resolvers = deferredRuns();
+    let idle = false;
+    const { pi, tools, bus, lifecycle } = await boot({ isIdle: () => idle });
+
+    const ids = await Promise.all([
+      spawnOverTool(tools, "tc-queued-first", "queued-child"),
+      spawnOverTool(tools, "tc-queued-second"),
+    ]);
+    await new Promise(r => setTimeout(r, 150));
+    for (const resolve of resolvers) resolve();
+    await new Promise(r => setTimeout(r, consumeDelay));
+
+    for (const ref of keepSibling ? ["queued-child"] : ["queued-child", ids[1]]) {
+      if (consumeVia === "tool") {
+        const result = await tools.get("get_subagent_result").execute(
+          `tc-queued-consume-${ref}`, { agent_id: ref }, undefined, undefined, ctx(),
+        );
+        expect(String(result.content[0].text)).toContain("Status: completed");
+      } else {
+        const consumed = vi.fn();
+        bus.on(`subagents:rpc:consume:reply:req-consume-${ref}`, consumed);
+        bus.emit("subagents:rpc:consume", { requestId: `req-consume-${ref}`, agentId: ref });
+        await vi.waitFor(() => expect(consumed).toHaveBeenCalledWith({ success: true }));
+      }
+    }
+    await new Promise(r => setTimeout(r, PAST_THE_HOLD_MS));
+    await spawnOverRpc(bus, "req-fill-first");
+    await spawnOverRpc(bus, "req-fill-second");
+    await resumeOverTool(tools, ids[0], "tc-queued-resume");
+    const queued = await tools.get("get_subagent_result").execute(
+      "tc-queued-status", { agent_id: ids[0] }, undefined, undefined, ctx(),
+    );
+    expect(String(queued.content[0].text)).toContain("Status: queued");
+
+    const stopped = vi.fn();
+    bus.on("subagents:rpc:stop:reply:req-stop-queued", stopped);
+    bus.emit("subagents:rpc:stop", { requestId: "req-stop-queued", agentId: ids[0] });
+    await vi.waitFor(() => expect(stopped).toHaveBeenCalledWith({ success: true }));
+
+    idle = true;
+    await lifecycle.get("agent_settled")?.();
+    await lifecycle.get("agent_settled")?.();
+    const sent = notifications(pi);
+    if (keepSibling) {
+      expect(sent).toHaveLength(1);
+      expect(JSON.stringify(sent[0])).not.toContain(ids[0]);
+      expect(JSON.stringify(sent[0])).toContain(ids[1]);
+      expect(JSON.stringify(sent[0])).toContain("GROUP_RESULT_2");
+    } else {
+      expect(sent).toEqual([]);
+    }
+  });
+
   it("notifies for an RPC-spawned agent nobody consumed", async () => {
     // The behaviour that makes the notification worth keeping: an unread result
     // is the caller's only signal that the agent finished.
