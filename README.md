@@ -142,7 +142,6 @@ While subagents are running, a Claude Code-style navigable list renders **below*
 
 ```
   esc to interrupt · ← for agents · ↓ to manage
-
   ● main
   ○ workflow         audit-src                    12/40 agents · 32s · ↓ 26.4k tokens
   ○ general-purpose  Sleep then report 1                                11s · ↓ 13.1k tokens
