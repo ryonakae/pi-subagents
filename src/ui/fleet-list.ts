@@ -210,7 +210,12 @@ export class FleetList {
         this.widgetRegistered = false;
         this.tui = undefined;
       }
-      if (this.timer) { clearInterval(this.timer); this.timer = undefined; }
+      // Session creation is asynchronous and may not emit another UI update.
+      const waitingForSession = this.enabled && this.manager.listAgents().some(a =>
+        isTopLevelAgent(a) && !a.session && (a.status === "running" || a.status === "queued")
+      );
+      if (waitingForSession) this.ensureTimer();
+      else if (this.timer) { clearInterval(this.timer); this.timer = undefined; }
       this.active = false;
       this.selectedIndex = 0;
       return;

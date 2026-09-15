@@ -438,6 +438,26 @@ describe("FleetList rendering", () => {
     expect(oldIdx).toBeLessThan(newIdx); // earliest sits above the later one
   });
 
+  it.each(["running", "queued"] as const)("shows a %s agent once its session is ready without another update event", (status) => {
+    vi.useFakeTimers();
+    const record = makeRecord({ status, session: undefined });
+    const h = harness([record]);
+    try {
+      expect(h.render()).toEqual([]);
+      vi.advanceTimersByTime(600);
+      expect(h.render()).toEqual([]);
+
+      record.status = "running";
+      record.session = FAKE_SESSION as AgentRecord["session"];
+      vi.advanceTimersByTime(200);
+
+      expect(h.render().map(plain).join("\n")).toContain("Sleep then report 1");
+    } finally {
+      h.fleet.dispose();
+      vi.useRealTimers();
+    }
+  });
+
   it("hides agents that have no session yet (pending)", () => {
     const agents = [
       makeRecord({ id: "live", description: "running one" }),
