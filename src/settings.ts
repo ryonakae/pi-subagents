@@ -6,9 +6,55 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { NO_FALLBACK } from "./agent-types.js";
-import type { AgentMentionMode, JoinMode, ViewerMarkdownMode, WidgetMode } from "./types.js";
+import type { AgentMentionMode, JoinMode, ThinkingLevel, ViewerMarkdownMode, WidgetMode } from "./types.js";
+
+export interface JevCandidateBenchmark {
+  scorePercent?: number;
+  scoreCi95HalfWidthPp?: number;
+  minutesPerTask?: number;
+  stepsPerTask?: number;
+  usdPerTask?: number;
+}
+
+export interface JevCandidate {
+  /** Canonical provider/model id. Fuzzy model names are not accepted here. */
+  model: string;
+  effort: ThinkingLevel;
+  description?: string;
+  benchmark?: JevCandidateBenchmark;
+}
+
+export interface JevBenchmarkMetadata {
+  name?: string;
+  url?: string;
+  date?: string;
+  conditions?: string;
+  notes?: string;
+  priceCorrectionUrl?: string;
+  priceCheckedAt?: string;
+}
+
+export interface JevSettings {
+  enabled: boolean;
+  model: string;
+  timeoutMs: number;
+  minConfidence: number;
+  maxRequestBytes: number;
+  candidates: JevCandidate[];
+  benchmark?: JevBenchmarkMetadata;
+}
+
+export const DEFAULT_JEV_SETTINGS: Readonly<Omit<JevSettings, "candidates">> = Object.freeze({
+  enabled: false,
+  model: "jev-1.13.0",
+  timeoutMs: 5000,
+  minConfidence: 0.7,
+  maxRequestBytes: 65_536,
+});
 
 export interface SubagentsSettings {
+  /** Global-only. Project `.pi/subagents.json` can neither enable nor override it. */
+  jev?: JevSettings;
   maxConcurrent?: number;
   /**
    * Max concurrent FOREGROUND (blocking) agents — `0` = unlimited, the default,
@@ -342,6 +388,9 @@ const VALID_TOOL_DESCRIPTION_MODES: ReadonlySet<string> = new Set<ToolDescriptio
 const VALID_WIDGET_MODES: ReadonlySet<string> = new Set<WidgetMode>(["all", "background", "off"]);
 const VALID_VIEWER_MARKDOWN_MODES: ReadonlySet<string> = new Set<ViewerMarkdownMode>(["off", "assistant", "all"]);
 const VALID_AGENT_MENTION_MODES: ReadonlySet<string> = new Set<AgentMentionMode>(["model", "direct", "off"]);
+const VALID_THINKING_LEVELS: ReadonlySet<string> = new Set<ThinkingLevel>([
+  "minimal", "low", "medium", "high", "xhigh", "max",
+]);
 
 // Sanity ceilings — prevent hand-edited configs from asking for values that
 // make no operational sense (e.g. 1e6 concurrent subagents). Permissive enough
@@ -351,11 +400,101 @@ const MAX_TURNS_CEILING = 10_000;
 const GRACE_TURNS_CEILING = 1_000;
 const SUBAGENT_DEPTH_CEILING = 16;
 
+function isFiniteNumber(value: unknown, min = 0): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= min;
+}
+
+function sanitizeCandidateBenchmark(raw: unknown): JevCandidateBenchmark | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  const out: JevCandidateBenchmark = {};
+  for (const key of [
+    "scorePercent",
+    "scoreCi95HalfWidthPp",
+    "minutesPerTask",
+    "stepsPerTask",
+    "usdPerTask",
+  ] as const) {
+    if (r[key] === undefined) continue;
+    if (!isFiniteNumber(r[key])) return undefined;
+    out[key] = r[key];
+  }
+  return out;
+}
+
+function sanitizeBenchmarkMetadata(raw: unknown): JevBenchmarkMetadata | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  const out: JevBenchmarkMetadata = {};
+  for (const key of [
+    "name",
+    "url",
+    "date",
+    "conditions",
+    "notes",
+    "priceCorrectionUrl",
+    "priceCheckedAt",
+  ] as const) {
+    if (r[key] === undefined) continue;
+    if (typeof r[key] !== "string" || !r[key].trim()) return undefined;
+    out[key] = r[key].trim();
+  }
+  return out;
+}
+
+function sanitizeJev(raw: unknown): JevSettings | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  if (r.enabled !== undefined && typeof r.enabled !== "boolean") return undefined;
+  if (r.model !== undefined && (typeof r.model !== "string" || !r.model.trim())) return undefined;
+  if (r.timeoutMs !== undefined && (!Number.isInteger(r.timeoutMs) || (r.timeoutMs as number) < 1)) return undefined;
+  if (r.minConfidence !== undefined && (!isFiniteNumber(r.minConfidence) || r.minConfidence > 1)) return undefined;
+  if (r.maxRequestBytes !== undefined && (!Number.isInteger(r.maxRequestBytes) || (r.maxRequestBytes as number) < 1)) {
+    return undefined;
+  }
+  if (r.candidates !== undefined && !Array.isArray(r.candidates)) return undefined;
+
+  const candidates: JevCandidate[] = [];
+  for (const rawCandidate of r.candidates ?? []) {
+    if (!rawCandidate || typeof rawCandidate !== "object" || Array.isArray(rawCandidate)) return undefined;
+    const candidate = rawCandidate as Record<string, unknown>;
+    if (typeof candidate.model !== "string" || !/^[^/\s]+\/[^/\s]+$/.test(candidate.model)) return undefined;
+    if (typeof candidate.effort !== "string" || !VALID_THINKING_LEVELS.has(candidate.effort)) return undefined;
+    if (candidate.description !== undefined && typeof candidate.description !== "string") return undefined;
+    const benchmark = candidate.benchmark === undefined
+      ? undefined
+      : sanitizeCandidateBenchmark(candidate.benchmark);
+    if (candidate.benchmark !== undefined && benchmark === undefined) return undefined;
+    candidates.push({
+      model: candidate.model,
+      effort: candidate.effort as ThinkingLevel,
+      ...(candidate.description !== undefined ? { description: candidate.description } : {}),
+      ...(benchmark !== undefined ? { benchmark } : {}),
+    });
+  }
+
+  const benchmark = r.benchmark === undefined ? undefined : sanitizeBenchmarkMetadata(r.benchmark);
+  if (r.benchmark !== undefined && benchmark === undefined) return undefined;
+  return {
+    enabled: r.enabled ?? DEFAULT_JEV_SETTINGS.enabled,
+    model: typeof r.model === "string" ? r.model.trim() : DEFAULT_JEV_SETTINGS.model,
+    timeoutMs: typeof r.timeoutMs === "number" ? r.timeoutMs : DEFAULT_JEV_SETTINGS.timeoutMs,
+    minConfidence: typeof r.minConfidence === "number" ? r.minConfidence : DEFAULT_JEV_SETTINGS.minConfidence,
+    maxRequestBytes: typeof r.maxRequestBytes === "number" ? r.maxRequestBytes : DEFAULT_JEV_SETTINGS.maxRequestBytes,
+    candidates,
+    ...(benchmark !== undefined ? { benchmark } : {}),
+  };
+}
+
 /** Drop fields that don't match the expected shape. Silent — garbage becomes absent. */
-function sanitize(raw: unknown): SubagentsSettings {
+function sanitize(raw: unknown, includeJev = false): SubagentsSettings {
   if (!raw || typeof raw !== "object") return {};
   const r = raw as Record<string, unknown>;
   const out: SubagentsSettings = {};
+  if (includeJev && r.jev !== undefined) {
+    const jev = sanitizeJev(r.jev);
+    if (jev !== undefined) out.jev = jev;
+  }
   if (
     Number.isInteger(r.maxConcurrent) &&
     (r.maxConcurrent as number) >= 1 &&
@@ -477,10 +616,17 @@ function projectPath(cwd: string): string {
  * exists but can't be parsed emits a warning to stderr so users aren't
  * silently reverted to defaults — and still returns `{}` so startup proceeds.
  */
-function readSettingsFile(path: string): SubagentsSettings {
+function readSettingsFile(path: string, includeJev = false): SubagentsSettings {
   if (!existsSync(path)) return {};
   try {
-    return sanitize(JSON.parse(readFileSync(path, "utf-8")));
+    const raw: unknown = JSON.parse(readFileSync(path, "utf-8"));
+    if (includeJev && raw && typeof raw === "object" && !Array.isArray(raw)) {
+      const rawJev = (raw as Record<string, unknown>).jev;
+      if (rawJev !== undefined && sanitizeJev(rawJev) === undefined) {
+        console.warn(`[pi-subagents] Ignoring invalid Jev settings at ${path}; Jev model selection is disabled.`);
+      }
+    }
+    return sanitize(raw, includeJev);
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     console.warn(`[pi-subagents] Ignoring malformed settings at ${path}: ${reason}`);
@@ -490,7 +636,7 @@ function readSettingsFile(path: string): SubagentsSettings {
 
 /** Load merged settings: global provides defaults, project overrides. */
 export function loadSettings(cwd: string = process.cwd()): SubagentsSettings {
-  return { ...readSettingsFile(globalPath()), ...readSettingsFile(projectPath(cwd)) };
+  return { ...readSettingsFile(globalPath(), true), ...readSettingsFile(projectPath(cwd)) };
 }
 
 /**
@@ -502,7 +648,9 @@ export function saveSettings(s: SubagentsSettings, cwd: string = process.cwd()):
   const path = projectPath(cwd);
   try {
     mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, JSON.stringify(s, null, 2), "utf-8");
+    const projectSettings = { ...s };
+    delete projectSettings.jev;
+    writeFileSync(path, JSON.stringify(projectSettings, null, 2), "utf-8");
     return true;
   } catch {
     return false;

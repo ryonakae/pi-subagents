@@ -38,6 +38,27 @@ const PREVIEW_LENGTH = 200;
 
 export class WorkflowRuntimeError extends Error {}
 
+export interface WorkflowModelDecision {
+  agentId: string;
+  model?: string;
+  effort?: string;
+}
+
+export interface WorkflowModelRequirement {
+  missing: ("model" | "effort")[];
+  fixed: { model?: string; effort?: string };
+  reason: string;
+}
+
+export interface WorkflowModelSelectionRequest extends WorkflowModelRequirement {
+  agentId: string;
+  label: string;
+  agentType: string;
+  prompt: string;
+}
+
+type ResolvedModelDecision = { model: string; effort: string };
+
 /**
  * Concurrent agents allowed, leaving two cores for the host and the TUI.
  *
@@ -58,6 +79,12 @@ export interface WorkflowSpawnRequest {
   label: string;
   agentType: string;
   model?: string;
+  signal?: AbortSignal;
+  /** Releases the execution permit only while the real parent is deciding. */
+  waitForModelSelection?(
+    requirement: WorkflowModelRequirement,
+    validate: (decision: WorkflowModelDecision) => ResolvedModelDecision,
+  ): Promise<ResolvedModelDecision>;
   /**
    * Reasoning effort for this child, as one of pi's thinking levels.
    *
@@ -246,6 +273,8 @@ export interface WorkflowControl {
   pause(): void;
   resume(): void;
   isPaused(): boolean;
+  /** Validates the whole batch before releasing any pending child. */
+  route?(decisions: readonly WorkflowModelDecision[]): string[];
   /**
    * Give up on the agent at `index`: its `agent()` call returns `null`, exactly
    * as a terminal failure does, and the row renders skipped.
@@ -287,6 +316,7 @@ export interface RunWorkflowOptions {
    * control. Fired before the first agent starts.
    */
   onControl?(control: WorkflowControl): void;
+  onModelSelectionRequired?(request: WorkflowModelSelectionRequest): void;
   /**
    * How many nested `workflow()` invocations one run may make in total.
    *
@@ -641,11 +671,17 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
   interface LiveAgent {
     agentId: string;
     started: boolean;
+    selecting?: boolean;
+    cancel?: () => void;
     intent?: "skip" | "retry";
     /** Wakes it out of a pause hold, so a skip does not wait for a resume. */
     wake?: () => void;
   }
   const liveAgents = new Map<number, LiveAgent>();
+  const pendingSelections = new Map<string, {
+    validate: (decision: WorkflowModelDecision) => ResolvedModelDecision;
+    resolve: (decision: ResolvedModelDecision) => void;
+  }>();
 
   /**
    * Output tokens this run has spent, mirrored to the script as
@@ -686,20 +722,41 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
     pause: () => { paused = true; },
     resume: () => { paused = false; releasePause(); },
     isPaused: () => paused,
+    route: decisions => {
+      if (settled || aborted) throw new WorkflowRuntimeError("Workflow is no longer live.");
+      if (!Array.isArray(decisions) || decisions.length === 0) {
+        throw new WorkflowRuntimeError("Provide at least one model selection decision.");
+      }
+      const seen = new Set<string>();
+      const validated = decisions.map(decision => {
+        if (seen.has(decision.agentId)) throw new WorkflowRuntimeError("Duplicate model selection agentId.");
+        seen.add(decision.agentId);
+        const pending = pendingSelections.get(decision.agentId);
+        if (pending === undefined) throw new WorkflowRuntimeError("Unknown or stale model selection agentId.");
+        return { agentId: decision.agentId, pending, value: pending.validate(decision) };
+      });
+      for (const { agentId, pending, value } of validated) {
+        pendingSelections.delete(agentId);
+        pending.resolve(value);
+      }
+      return validated.map(entry => entry.agentId);
+    },
     skip: index => {
       const live = liveAgents.get(index);
       if (live === undefined || live.intent !== undefined) return false;
       live.intent = "skip";
       // A running child is stopped, which comes back as a skipped result; a
       // held one is woken so it can bail at the gate it is parked on.
+      live.cancel?.();
       if (live.started) host.abortAgent(live.agentId);
-      else live.wake?.();
+      live.wake?.();
       return true;
     },
     retry: index => {
       const live = liveAgents.get(index);
-      if (live === undefined || !live.started || live.intent !== undefined) return false;
+      if (live === undefined || !live.started || live.selecting || live.intent !== undefined) return false;
       live.intent = "retry";
+      live.cancel?.();
       host.abortAgent(live.agentId);
       return true;
     },
@@ -753,6 +810,8 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
       // promise resolves either way — it just does not leave live-agent
       // bookkeeping behind for a run that is over.
       releasePause();
+      for (const live of liveAgents.values()) live.cancel?.();
+      pendingSelections.clear();
       for (const agentId of inflight) host.abortAgent(agentId);
       inflight.clear();
       semaphore.drain();
@@ -1012,6 +1071,62 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
           live.started = true;
           inflight.add(agentId);
 
+          let permitHeld = true;
+          const attemptAbort = new AbortController();
+          live.cancel = () => attemptAbort.abort(new Error("Workflow agent cancelled."));
+          const waitForModelSelection: NonNullable<WorkflowSpawnRequest["waitForModelSelection"]> = async (requirement, validate) => {
+            attemptAbort.signal.throwIfAborted();
+            if (settled || aborted) throw new Error("Workflow aborted.");
+            if (options.onModelSelectionRequired === undefined) throw new Error("Parent model selection notification unavailable.");
+            live.selecting = true;
+            base.selectionPending = true;
+            emit([{ ...base, queuedAt, ...attemptMark }]);
+            semaphore.release();
+            permitHeld = false;
+            let decision: ResolvedModelDecision;
+            try {
+              decision = await new Promise<ResolvedModelDecision>((resolveDecision, rejectDecision) => {
+                const onCancel = () => {
+                  pendingSelections.delete(agentId);
+                  rejectDecision(new Error("Workflow agent cancelled."));
+                };
+                pendingSelections.set(agentId, {
+                  validate,
+                  resolve: value => {
+                    attemptAbort.signal.removeEventListener("abort", onCancel);
+                    resolveDecision(value);
+                  },
+                });
+                attemptAbort.signal.addEventListener("abort", onCancel, { once: true });
+                try {
+                  options.onModelSelectionRequired!({ ...requirement, agentId, label, agentType, prompt: payload.prompt });
+                } catch {
+                  pendingSelections.delete(agentId);
+                  attemptAbort.signal.removeEventListener("abort", onCancel);
+                  rejectDecision(new Error("Parent model selection notification unavailable."));
+                }
+              });
+              for (;;) {
+                attemptAbort.signal.throwIfAborted();
+                if (settled || aborted) throw new Error("Workflow aborted.");
+                await pauseGate(live);
+                attemptAbort.signal.throwIfAborted();
+                await semaphore.acquire();
+                permitHeld = true;
+                attemptAbort.signal.throwIfAborted();
+                if (settled || aborted) throw new Error("Workflow aborted.");
+                if (!isPaused()) break;
+                semaphore.release();
+                permitHeld = false;
+              }
+              return decision;
+            } finally {
+              pendingSelections.delete(agentId);
+              live.selecting = false;
+              base.selectionPending = false;
+              if (!settled) emit([{ ...base, queuedAt, startedAt, ...attemptMark }]);
+            }
+          };
           let result: WorkflowSpawnResult;
           try {
             result =
@@ -1033,6 +1148,8 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
                     // child's worktree does, and hands back `result.gate`.
                     ...(payload.gate !== undefined ? { gate: payload.gate } : {}),
                     onResolved,
+                    signal: attemptAbort.signal,
+                    waitForModelSelection,
                   });
             if (result.ok) {
               // Recorded before the gate runs: the child itself finished, so it is
@@ -1060,11 +1177,13 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
               }
             }
           } catch (error) {
-            result = { ok: false, error: error instanceof Error ? error.message : String(error) };
+            result = { ok: false, error: error instanceof Error ? error.message : String(error),
+              ...(attemptAbort.signal.aborted ? { skipped: true } : {}) };
           } finally {
             inflight.delete(agentId);
             live.started = false;
-            semaphore.release();
+            live.cancel = undefined;
+            if (permitHeld) semaphore.release();
           }
 
           if (settled) return;

@@ -33,11 +33,15 @@
  */
 
 import { existsSync } from "node:fs";
+import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentManager } from "../agent-manager.js";
 import { getAgentConfig, resolveSpawnType } from "../agent-types.js";
+import { readEnabledModels, resolveEnabledModels } from "../enabled-models.js";
+import { selectJevCandidate } from "../jev-selector.js";
 import { resolveModel } from "../model-resolver.js";
 import { checkModelScope } from "../model-scope.js";
+import type { JevSettings } from "../settings.js";
 import type { AgentRecord, ThinkingLevel } from "../types.js";
 import { getLifetimeTotal } from "../usage.js";
 import type { WorkflowGateResult, WorkflowHost, WorkflowSpawnResult } from "./runtime.js";
@@ -68,6 +72,8 @@ export interface WorkflowHostOptions {
    */
   workflowId?: string;
   gateTimeoutMs?: number;
+  /** Global-only Jev routing configuration captured at extension startup. */
+  jev?: { config: JevSettings; guide: string };
 }
 
 /**
@@ -194,22 +200,95 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
 
   return {
     async spawnAgent(request) {
+      const signal = request.signal && deps.signal
+        ? AbortSignal.any([request.signal, deps.signal]) : request.signal ?? deps.signal;
+      signal?.throwIfAborted();
       const dispatch = resolveSpawnType(request.agentType);
       if (!dispatch.ok) return { ok: false, error: dispatch.message };
 
-      // Same precedence as the Agent tool: the caller's model wins, the agent
-      // definition's is next, and the parent's is the floor. A model the script
-      // named and we cannot resolve is an error; one the definition named falls
-      // back to the parent silently, because the script never asked for it.
+      // Frontmatter is authoritative, including when automatic selection is off.
       let model = ctx.model;
       const config = getAgentConfig(dispatch.type);
-      const modelInput = request.model ?? config?.model;
+      const modelInput = config?.model ?? request.model;
       if (modelInput !== undefined) {
         const resolved = resolveModel(modelInput, ctx.modelRegistry);
         if (typeof resolved === "string") {
-          if (request.model !== undefined) return { ok: false, error: resolved };
+          return { ok: false, error: resolved };
         } else {
           model = resolved;
+        }
+      }
+
+      const fixedEffort = (config?.thinking ?? request.effort) as ThinkingLevel | undefined;
+      if (fixedEffort !== undefined && !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(fixedEffort)) {
+        return { ok: false, error: "Invalid thinking level in agent definition or request; no child started." };
+      }
+      let effort = fixedEffort;
+      if (deps.jev !== undefined) {
+        const enabledModelPatterns = readEnabledModels(ctx.cwd);
+        const enabledModels = enabledModelPatterns === undefined
+          ? undefined
+          : resolveEnabledModels(enabledModelPatterns, ctx.modelRegistry, ctx.cwd) ?? new Set<string>();
+        const selection = await selectJevCandidate({
+          task: request.prompt,
+          role: config?.description ?? dispatch.type,
+          guide: deps.jev.guide,
+          config: deps.jev.config,
+          registry: ctx.modelRegistry,
+          fixedModel: modelInput !== undefined ? model : undefined,
+          fixedEffort,
+          enabledModels,
+          signal,
+        });
+        signal?.throwIfAborted();
+        if (selection.kind === "fallback" && deps.jev.config.enabled) {
+          if (request.waitForModelSelection === undefined) {
+            return { ok: false, error: "Parent model selection notification unavailable; no child started." };
+          }
+          const decision = await request.waitForModelSelection({
+            missing: [
+              ...(modelInput === undefined ? ["model" as const] : []),
+              ...(fixedEffort === undefined ? ["effort" as const] : []),
+            ],
+            fixed: {
+              ...(modelInput !== undefined ? { model: `${model!.provider}/${model!.id}` } : {}),
+              ...(fixedEffort !== undefined ? { effort: fixedEffort } : {}),
+            },
+            reason: selection.warning ?? "Automatic selection unavailable.",
+          }, decision => {
+            signal?.throwIfAborted();
+            const chosenInput = decision.model ?? modelInput;
+            const chosenEffort = decision.effort ?? fixedEffort;
+            if (!chosenInput?.trim() || chosenEffort === undefined) {
+              throw new Error("Model selection decision is missing model or effort.");
+            }
+            const chosenModel = resolveModel(chosenInput, ctx.modelRegistry);
+            if (typeof chosenModel === "string") throw new Error(chosenModel);
+            if (modelInput !== undefined && (chosenModel.provider !== model?.provider || chosenModel.id !== model?.id)) {
+              throw new Error("Model selection decision conflicts with the fixed model.");
+            }
+            if (fixedEffort !== undefined && chosenEffort !== fixedEffort) {
+              throw new Error("Model selection decision conflicts with the fixed effort.");
+            }
+            if (!getSupportedThinkingLevels(chosenModel).includes(chosenEffort as ThinkingLevel)) {
+              throw new Error("Model selection decision has an unsupported effort for this model.");
+            }
+            const scope = checkModelScope({
+              model: chosenModel, cwd: ctx.cwd, modelRegistry: ctx.modelRegistry,
+              callerSupplied: config?.model === undefined,
+              agentLabel: config?.displayName ?? dispatch.type, modelInput: chosenInput,
+            });
+            if (scope.kind === "error") throw new Error(scope.message);
+            return { model: `${chosenModel.provider}/${chosenModel.id}`, effort: chosenEffort };
+          });
+          signal?.throwIfAborted();
+          const chosen = resolveModel(decision.model, ctx.modelRegistry);
+          if (typeof chosen === "string") return { ok: false, error: chosen };
+          model = chosen;
+          effort = decision.effort as ThinkingLevel;
+        } else if (selection.kind === "selected") {
+          if (modelInput === undefined) model = selection.model;
+          if (fixedEffort === undefined) effort = selection.effort;
         }
       }
 
@@ -224,7 +303,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
         model,
         cwd: ctx.cwd,
         modelRegistry: ctx.modelRegistry,
-        callerSupplied: request.model !== undefined,
+        callerSupplied: config?.model === undefined && request.model !== undefined,
         agentLabel: config?.displayName ?? dispatch.type,
         modelInput,
       });
@@ -310,26 +389,27 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
             // cast asserts what the boundary has already checked. Left unset,
             // the agent definition's `thinking` (then the parent's) still wins —
             // same precedence as `model` above.
-            ...(request.effort !== undefined ? { thinkingLevel: request.effort as ThinkingLevel } : {}),
+            ...(effort !== undefined ? { thinkingLevel: effort } : {}),
             // Seeded with the REQUEST, not the outcome. The manager overwrites
             // the effective half at session creation; without a seed there is
             // nothing for it to compare against, so a level pi clamped would be
             // indistinguishable from one that was honoured.
             //
-            // Only the level. #182's other half — a caller parameter an agent
-            // file outranked — cannot arise here: this path resolves
-            // `request.model ?? config?.model`, so the script always wins and
-            // therefore always got what it asked for. Seeding a `requestedModel`
-            // would describe a precedence this path does not have.
             invocation: {
-              ...(request.effort !== undefined ? { thinking: request.effort as ThinkingLevel } : {}),
+              ...(effort !== undefined ? { thinking: effort } : {}),
+              ...(request.effort !== undefined && request.effort !== effort
+                ? { requestedThinking: request.effort as ThinkingLevel } : {}),
+              ...(request.model !== undefined && config?.model !== undefined && (() => {
+                const asked = resolveModel(request.model, ctx.modelRegistry);
+                return typeof asked === "string" || asked.provider !== model?.provider || asked.id !== model?.id;
+              })() ? { requestedModel: request.model } : {}),
             },
             // Fires once the child's session exists, which is where the model
             // and the clamped thinking level first become knowable.
             onSessionCreated: () => { sessionReady = true; reportResolved(); },
             ...(request.schema !== undefined ? { structuredOutput: request.schema } : {}),
             ...(request.isolation !== undefined ? { isolation: request.isolation } : {}),
-            ...(deps.signal !== undefined ? { signal: deps.signal } : {}),
+            ...(signal !== undefined ? { signal } : {}),
             ...(deps.rootSessionId !== undefined ? { rootSessionId: deps.rootSessionId } : {}),
             ...(onBeforeWorktreeCleanup !== undefined ? { onBeforeWorktreeCleanup } : {}),
           },

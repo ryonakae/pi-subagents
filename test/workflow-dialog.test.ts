@@ -26,6 +26,17 @@ import type { WorkflowAgentEntry, WorkflowEntry } from "../src/workflow/progress
 
 const START = 1_000_000;
 
+it("shows parent selection waiting and permits skip, not retry", () => {
+  const lines = dialog({
+    width: 140,
+    state: { level: "agent" },
+    progress: [agentEntry({ index: 0, selectionPending: true, queuedAt: START, startedAt: START })],
+  }).join("\n");
+  expect(lines).toContain("awaiting parent model selection");
+  expect(lines).toContain("s skip");
+  expect(lines).not.toContain("r retry");
+});
+
 /** A theme that makes every colour and bold span visible in the assertion. */
 const theme = {
   fg: (color: string, text: string) => `<${color}>${text}</${color}>`,

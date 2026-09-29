@@ -1,5 +1,12 @@
 # pi-subagents (ryonakae fork)
 
+> **Fork note:** This is an independently maintained fork of [tintinweb/pi-subagents](https://github.com/tintinweb/pi-subagents). The `feat/jev-routing` branch adds:
+> - Jev model/effort selection that returns the decision to the actual parent when Jev declines or cannot select, rather than silently inheriting.
+> - Definition-priority model/effort resolution for both `Agent` and `SubagentWorkflow` calls.
+> - Read-only child-session identification for inline-skills integrations.
+>
+> Jev is off by default (`jev.enabled: false`). Install this branch with `pi install git:github.com/ryonakae/pi-subagents@feat/jev-routing`.
+
 A focused fork of [tintinweb/pi-subagents](https://github.com/tintinweb/pi-subagents). It retains upstream's tools and workflow support while fixing completion notifications that arrive after their results have already been consumed in TUI and RPC sessions. The notification fix follows [vincelwt's PR #265](https://github.com/tintinweb/pi-subagents/pull/265).
 
 A [pi](https://pi.dev) extension that brings **Claude Code-style autonomous sub-agents and workflow orchestration** to pi. Spawn specialized agents that run in isolated sessions — each with its own tools, system prompt, model, and thinking level. Run them in the background (the default) or block on them, steer them mid-run, resume completed sessions, and define your own custom agent types. When the orchestration shouldn't be improvised, hand a deterministic JavaScript script to the `SubagentWorkflow` tool — `agent()`, `parallel()`, `pipeline()` — and scripts written for Claude Code's `Workflow` tool run here unchanged.
@@ -625,7 +632,43 @@ Runtime tuning values set via `/agents` → Settings (max concurrency, max foreg
 - **Global:** `~/.pi/agent/subagents.json` — your machine-wide defaults. Edit by hand; the `/agents` menu never writes here.
 - **Project:** `<cwd>/.pi/subagents.json` — per-project overrides. Written by `/agents` → Settings.
 
-**Precedence:** project overrides global on any field present in both. Missing fields fall back to the hardcoded defaults (max concurrency `10`, max foreground concurrency `0` = unlimited, default max turns unlimited, grace turns `5`, nested depth `2`, join mode `smart`, defaults enabled).
+**Precedence:** project overrides global on any field present in both, except `jev`, which is global-only and ignored in project settings. Missing fields fall back to the hardcoded defaults (max concurrency `10`, max foreground concurrency `0` = unlimited, default max turns unlimited, grace turns `5`, nested depth `2`, join mode `smart`, defaults enabled).
+
+**Jev model selection** (`jev.enabled`, default `false`): optionally asks [TypeSafe SystemOne](https://typesafe.ai/) to choose a model/thinking pair for a newly spawned top-level `Agent` or Workflow `agent()` call when either value is omitted. Agent frontmatter wins over call values; explicit call values fill only gaps in the definition, and Jev fills the remaining gaps. Invalid fixed model/thinking values stop the launch. With one eligible candidate selection is local and deterministic; with two or more, the selector sends the task, role, selection guide and structured candidate criteria to SystemOne's Choice endpoint. It sends no parent conversation. Set `TYPESAFE_API_KEY` in the environment to enable HTTP selection.
+
+The setting is accepted only from the global `<agentDir>/subagents.json`; a project's `.pi/subagents.json` cannot enable or alter it, and `/agents` never writes it. Candidate models must use canonical `provider/modelId` identifiers. Candidates are filtered through pi's available model registry, `enabledModels`, any fixed model or effort, and the model's supported thinking levels. With the required guides present, one eligible candidate is used without HTTP. No eligible candidate, Choice abstention, low confidence, timeout, HTTP/JSON/schema error, missing API key, or request-size violation requires an explicit decision from the actual parent before the child starts; it never silently inherits. User cancellation aborts instead of requesting selection. Resume, nested delegation, scheduled jobs and cross-extension RPC keep their existing model behavior.
+
+```json
+{
+  "jev": {
+    "enabled": false,
+    "model": "jev-1.13.0",
+    "timeoutMs": 5000,
+    "minConfidence": 0.7,
+    "maxRequestBytes": 65536,
+    "candidates": [
+      {
+        "model": "anthropic/claude-sonnet-4-6",
+        "effort": "high",
+        "description": "General implementation and review",
+        "benchmark": { "scorePercent": 72.5, "usdPerTask": 0.18 }
+      }
+    ],
+    "benchmark": {
+      "name": "Internal routing benchmark",
+      "url": "https://example.invalid/benchmark",
+      "date": "2026-09-28",
+      "conditions": "Describe the evaluated task set and runtime conditions"
+    }
+  }
+}
+```
+
+The shared selection criteria live at `<agentDir>/model-selection-guide.md`; its `{{modelCandidates}}` placeholder becomes a Markdown table for the parent model and a structured-criteria reference for the Jev request, so the candidate payload is not duplicated in prose. When Jev is enabled, `<agentDir>/model-selection-auto-guide.md` is shown to the parent instead. A missing required guide makes automatic selection unavailable for that session with a warning, but does not turn Jev off: unresolved fields still require the parent to decide. Keep benchmark source, date and conditions in the global `benchmark` object; both parent-facing and Jev-facing representations retain them.
+
+On an ordinary `Agent` selection failure, the tool returns `status: "model_selection_required"`, `missing`, `fixed`, `reason`, and `guide`, with no child created. The parent reads the guide and resubmits the same task with explicit missing `model`/`thinking` fields; once both are fixed, Jev is not called again. Do not precompute fallback choices on normal automatic requests.
+
+For a Workflow, the same run waits only for the affected agent. A `workflow-model-selection-required` follow-up wakes the original parent, which answers with `SubagentWorkflow({action: "route", runId, decisions: [{agentId, model?, effort?}]})`. Successful jobs and gates are not rerun. See [parent selection in workflows](docs/workflows.md#parent-model-selection). Explicit `jev.enabled: false` retains manual selection/inheritance; definitions still win. Pending selections are process-local and are not restored after a crash or reload.
 
 **Nested depth** (`maxSubagentDepth`, default `2`): the hard ceiling on [nested delegation](#nested-subagents), counted from the main session (main = 0, its subagents = 1). `0` or `1` disables nesting project-wide regardless of any agent's `allowed_subagents`. Read when a subagent session is built, so a change applies to agents started after it.
 
@@ -709,7 +752,7 @@ Launch an autonomous agent. Available types:
 Custom agents live in .pi/agents/ or {{agentDir}}/agents/.
 ```
 
-Placeholders: `{{typeList}}` (full per-agent descriptions), `{{compactTypeList}}` (first sentence each), `{{agentDir}}`, `{{isolationGuideline}}` and `{{scheduleGuideline}}` (each expands with its own leading newline + `- ` bullet when the matching feature is on — place them directly after your last rule line; empty when [worktree isolation](#turning-worktrees-off) / scheduling is off). Unknown placeholders are left verbatim with a stderr warning; a missing or empty file falls back to `"full"` with a warning. Note the usual trust umbrella: a project-level file shapes the orchestrator's prompt, same as project agents and extensions do.
+Placeholders: `{{typeList}}` (full per-agent descriptions), `{{compactTypeList}}` (first sentence each), `{{agentDir}}`, `{{modelSelectionGuide}}` (manual guide when Jev is off, auto guide when on), `{{modelCandidates}}` (the configured candidate table), `{{isolationGuideline}}` and `{{scheduleGuideline}}` (each expands with its own leading newline + `- ` bullet when the matching feature is on — place them directly after your last rule line; empty when [worktree isolation](#turning-worktrees-off) / scheduling is off). Unknown placeholders are left verbatim with a stderr warning; a missing or empty file falls back to `"full"` with a warning. Note the usual trust umbrella: a project-level file shapes the orchestrator's prompt, same as project agents and extensions do.
 
 **Starting point:** copy [`examples/agent-tool-description.md`](examples/agent-tool-description.md) — it reproduces the default full description exactly (a CI test keeps it in sync), so you can trim from a known-good baseline instead of writing from scratch.
 
@@ -960,7 +1003,7 @@ src/
   agent-runner.ts     # Session creation, execution, graceful max_turns, steer/resume
   agent-manager.ts    # Agent lifecycle, concurrency queue, completion notifications
   nested-tools.ts     # Delegation tools handed to subagents (nested spawn/collect/steer)
-  child-context.ts    # AsyncLocalStorage flag marking work done for a child session
+  child-context.ts    # AsyncLocalStorage child flag + versioned global read-only accessor
   abortable.ts        # Race a wait against Esc without cancelling the background child
   group-join.ts       # Group join manager: batched completion notifications with timeout
   nudge-queue.ts      # Cancellable completion delivery held until the parent is idle
@@ -988,6 +1031,8 @@ src/
   prompts.ts          # Config-driven system prompt builder
   context.ts          # Parent conversation context for inherit_context
   settings.ts         # Persistent settings (~/.pi/agent/subagents.json + .pi/subagents.json)
+  jev-selector.ts     # TypeSafe SystemOne Choice client and model/effort candidate filtering
+  model-selection-guide.ts # Parent/Jev guide rendering and benchmark metadata
   env.ts              # Environment detection (git, platform)
 
   workflow/

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { WorkflowJournalEntry } from "../src/workflow/journal.js";
 import { buildPhaseGroups, type WorkflowAgentEntry, type WorkflowEntry } from "../src/workflow/progress.js";
 import {
@@ -368,6 +368,153 @@ describe("semaphore", () => {
     );
     const queuedOnly = agentEntries(result.progress).filter(e => e.queuedAt != null && e.startedAt == null);
     expect(queuedOnly.length).toBeGreaterThan(0);
+  });
+});
+
+describe("parent model selection", () => {
+  it("fails without spawning when the parent notification cannot be delivered", async () => {
+    let spawned = false;
+    const { host } = stubHost(async request => {
+      await request.waitForModelSelection!({ missing: ["model", "effort"], fixed: {}, reason: "abstained" },
+        decision => ({ model: decision.model!, effort: decision.effort! }));
+      spawned = true;
+      return { ok: true, text: "wrong" };
+    });
+    const result = await run("return await agent('wait');", {
+      host,
+      onModelSelectionRequired: () => { throw new Error("private notification detail"); },
+    });
+    expect(result.value).toBeNull();
+    expect(spawned).toBe(false);
+    expect(agentEntries(result.progress).at(-1)?.error).toBe("Parent model selection notification unavailable.");
+  });
+
+  it.each(["skip", "abort"] as const)("cleans up waiting selections on %s and refuses late decisions", async action => {
+    let control: WorkflowControl | undefined;
+    const requested: string[] = [];
+    const spawned: string[] = [];
+    const abort = new AbortController();
+    const { host } = stubHost(async request => {
+      await request.waitForModelSelection!({ missing: ["model", "effort"], fixed: {}, reason: "abstained" },
+        decision => ({ model: decision.model!, effort: decision.effort! }));
+      spawned.push(request.prompt);
+      return { ok: true, text: "done" };
+    });
+    const done = run("return await agent('wait');", {
+      host, signal: abort.signal,
+      onControl: value => { control = value; },
+      onModelSelectionRequired: request => { requested.push(request.agentId); },
+    });
+    try {
+      await vi.waitFor(() => expect(requested).toHaveLength(1));
+      expect(control!.retry(0)).toBe(false);
+      if (action === "skip") expect(control!.skip(0)).toBe(true);
+      else abort.abort();
+      const result = await done;
+      expect(result.status).toBe(action === "skip" ? "completed" : "killed");
+      if (action === "skip") expect(result.value).toBeNull();
+      expect(spawned).toEqual([]);
+      expect(() => control!.route!([{ agentId: requested[0], model: "test/model", effort: "low" }])).toThrow(/live|stale/);
+    } finally { abort.abort(); await done; }
+  });
+
+  it("accepts a route while paused but starts nothing until unpaused", async () => {
+    let control: WorkflowControl | undefined;
+    const requested: string[] = [];
+    const spawned: string[] = [];
+    const abort = new AbortController();
+    const { host } = stubHost(async request => {
+      await request.waitForModelSelection!({ missing: ["model", "effort"], fixed: {}, reason: "abstained" },
+        decision => ({ model: decision.model!, effort: decision.effort! }));
+      spawned.push(request.prompt);
+      return { ok: true, text: "done" };
+    });
+    const done = run("return await agent('wait');", {
+      host, signal: abort.signal,
+      onControl: value => { control = value; },
+      onModelSelectionRequired: request => { requested.push(request.agentId); },
+    });
+    try {
+      await vi.waitFor(() => expect(requested).toHaveLength(1));
+      control!.pause();
+      control!.route!([{ agentId: requested[0], model: "test/model", effort: "low" }]);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(spawned).toEqual([]);
+      control!.resume();
+      expect((await done).value).toBe("done");
+      expect(spawned).toEqual(["wait"]);
+    } finally { abort.abort(); await done; }
+  });
+
+  it("bounds selector work before handoff and reacquires permits after a batch route", async () => {
+    let control: WorkflowControl | undefined;
+    const requested: string[] = [];
+    const release: (() => void)[] = [];
+    let selecting = 0;
+    let running = 0;
+    let peak = 0;
+    const abort = new AbortController();
+    const { host } = stubHost(async request => {
+      selecting++;
+      await new Promise<void>(resolve => release.push(resolve));
+      selecting--;
+      await request.waitForModelSelection!({ missing: ["model", "effort"], fixed: {}, reason: "abstained" },
+        decision => ({ model: decision.model!, effort: decision.effort! }));
+      running++;
+      peak = Math.max(peak, running);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      running--;
+      return { ok: true, text: request.prompt };
+    });
+    const done = run("return await parallel([() => agent('a'), () => agent('b'), () => agent('c')]);", {
+      host, concurrency: 1, signal: abort.signal,
+      onControl: value => { control = value; },
+      onModelSelectionRequired: request => { requested.push(request.agentId); },
+    });
+    try {
+      for (let i = 0; i < 3; i++) {
+        await vi.waitFor(() => expect(release).toHaveLength(i + 1));
+        expect(selecting).toBe(1);
+        release[i]();
+      }
+      await vi.waitFor(() => expect(requested).toHaveLength(3));
+      control!.route!(requested.map(agentId => ({ agentId, model: "test/model", effort: "low" })));
+      expect((await done).value).toEqual(["a", "b", "c"]);
+      expect(peak).toBe(1);
+    } finally { abort.abort(); await done; }
+  });
+
+  it("returns the permit while waiting, then continues the same call without rerunning siblings or gates", async () => {
+    let control: WorkflowControl | undefined;
+    const requested: string[] = [];
+    const spawned: string[] = [];
+    const gates: string[] = [];
+    const abort = new AbortController();
+    const stub = stubHost(async request => {
+      if (request.prompt === "wait") {
+        await request.waitForModelSelection!({ missing: ["model", "effort"], fixed: {}, reason: "abstained" },
+          decision => ({ model: decision.model!, effort: decision.effort! }));
+      }
+      spawned.push(request.prompt);
+      return { ok: true, text: request.prompt };
+    });
+    stub.host.runGate = async command => { gates.push(command); return { ok: true, output: "ok" }; };
+    const done = run("return await parallel([() => agent('wait'), () => agent('independent', { gate: 'verify' })]);", {
+      host: stub.host,
+      concurrency: 1,
+      signal: abort.signal,
+      onControl: value => { control = value; },
+      onModelSelectionRequired: request => { requested.push(request.agentId); },
+    });
+    try {
+      await vi.waitFor(() => expect(spawned).toEqual(["independent"]));
+      expect(requested).toEqual(["wf-agent-0"]);
+      expect(gates).toEqual(["verify"]);
+      expect(control!.route!([{ agentId: "wf-agent-0", model: "test/model", effort: "low" }])).toEqual(["wf-agent-0"]);
+      expect((await done).value).toEqual(["wait", "independent"]);
+      expect(spawned).toEqual(["independent", "wait"]);
+      expect(gates).toEqual(["verify"]);
+    } finally { abort.abort(); await done; }
   });
 });
 

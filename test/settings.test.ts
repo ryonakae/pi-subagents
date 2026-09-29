@@ -66,6 +66,123 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({ maxConcurrent: 16, graceTurns: 10 });
   });
 
+  it("loads a valid Jev configuration from global settings only", () => {
+    const jev = {
+      enabled: true,
+      model: "jev-1.13.0",
+      timeoutMs: 5000,
+      minConfidence: 0.7,
+      maxRequestBytes: 65_536,
+      candidates: [
+        {
+          model: "anthropic/claude-sonnet-4-6",
+          effort: "high",
+          description: "Deep implementation work",
+          benchmark: {
+            scorePercent: 72.4,
+            scoreCi95HalfWidthPp: 1.8,
+            minutesPerTask: 8.2,
+            stepsPerTask: 14.1,
+            usdPerTask: 0.42,
+          },
+        },
+      ],
+      benchmark: {
+        name: "DeepSWE",
+        url: "https://example.com/benchmark",
+        date: "2026-09-01",
+        conditions: "Public benchmark conditions",
+        notes: "Reference data, not a task guarantee.",
+        priceCorrectionUrl: "https://example.com/prices",
+        priceCheckedAt: "2026-09-28",
+      },
+    };
+    writeGlobal({ jev });
+
+    expect(loadSettings(projectDir).jev).toEqual(jev);
+  });
+
+  it("warns without exposing raw values and disables invalid global Jev settings", () => {
+    writeGlobal({
+      jev: {
+        enabled: true,
+        candidates: [{
+          model: "private-provider/private-model",
+          effort: "secret-effort-typo",
+          description: "private delegated task",
+          apiKey: "secret-api-key",
+        }],
+      },
+    });
+    const spy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(loadSettings(projectDir).jev).toBeUndefined();
+      expect(spy).toHaveBeenCalledOnce();
+      const warning = String(spy.mock.calls[0]?.[0]);
+      expect(warning).toContain("Ignoring invalid Jev settings");
+      expect(warning).toContain("Jev model selection is disabled");
+      expect(warning).not.toContain("private-provider");
+      expect(warning).not.toContain("secret-effort-typo");
+      expect(warning).not.toContain("private delegated task");
+      expect(warning).not.toContain("secret-api-key");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("does not warn when global Jev settings are absent", () => {
+    writeGlobal({ maxConcurrent: 16 });
+    const spy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(loadSettings(projectDir)).toEqual({ maxConcurrent: 16 });
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("never enables or overrides Jev from project settings", () => {
+    writeGlobal({
+      jev: {
+        enabled: false,
+        model: "jev-1.13.0",
+        timeoutMs: 5000,
+        minConfidence: 0.7,
+        maxRequestBytes: 65_536,
+        candidates: [],
+      },
+    });
+    writeProject({
+      jev: {
+        enabled: true,
+        model: "project-model",
+        timeoutMs: 1,
+        minConfidence: 0,
+        maxRequestBytes: 1,
+        candidates: [{ model: "project/model", effort: "max" }],
+      },
+    });
+
+    expect(loadSettings(projectDir).jev).toMatchObject({ enabled: false, model: "jev-1.13.0" });
+  });
+
+  it("never persists Jev into project settings", () => {
+    const settings = {
+      jev: {
+        enabled: true,
+        model: "jev-1.13.0",
+        timeoutMs: 5000,
+        minConfidence: 0.7,
+        maxRequestBytes: 65_536,
+        candidates: [{ model: "anthropic/claude-sonnet-4-6", effort: "high" as const }],
+      },
+      maxConcurrent: 8,
+    };
+
+    expect(saveSettings(settings, projectDir)).toBe(true);
+    expect(JSON.parse(readFileSync(projectFile(), "utf-8"))).toEqual({ maxConcurrent: 8 });
+  });
+
   it("loads from project when no global file", () => {
     writeProject({ maxConcurrent: 8, defaultJoinMode: "group" });
     expect(loadSettings(projectDir)).toEqual({ maxConcurrent: 8, defaultJoinMode: "group" });

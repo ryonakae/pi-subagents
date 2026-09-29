@@ -215,6 +215,49 @@ describe("toolDescriptionMode", () => {
     expect(desc).not.toContain("schedule");
   });
 
+  it("uses the manual model guide while Jev is off and expands the candidate table", () => {
+    const tools = setup({ toolDescriptionMode: "custom" }, () => {
+      writeFileSync(join(hermeticAgentDir, "model-selection-guide.md"), "MANUAL {{modelCandidates}}");
+      writeFileSync(join(hermeticAgentDir, "subagents.json"), JSON.stringify({
+        jev: {
+          enabled: false,
+          candidates: [{ model: "anthropic/claude-sonnet-4-6", effort: "high" }],
+        },
+      }));
+      writeFileSync(
+        join(tmpDir, ".pi", "agent-tool-description.md"),
+        "GUIDE: {{modelSelectionGuide}}\nTABLE: {{modelCandidates}}",
+      );
+    });
+    const tool = tools.get("Agent");
+    expect(tool.description).toContain("GUIDE: MANUAL");
+    expect(tool.description).toContain("anthropic/claude-sonnet-4-6");
+    expect(tool.parameters.properties.model.description).toContain("Omit to inherit");
+  });
+
+  it("uses the auto guide while Jev is on and requests actual-parent selection on failure", () => {
+    const tools = setup({ toolDescriptionMode: "custom" }, () => {
+      writeFileSync(join(hermeticAgentDir, "model-selection-guide.md"), "CRITERIA {{modelCandidates}}");
+      writeFileSync(join(hermeticAgentDir, "model-selection-auto-guide.md"), "AUTO: normally omit model and thinking");
+      writeFileSync(join(hermeticAgentDir, "subagents.json"), JSON.stringify({
+        jev: {
+          enabled: true,
+          candidates: [{ model: "anthropic/claude-sonnet-4-6", effort: "high" }],
+        },
+      }));
+      writeFileSync(
+        join(tmpDir, ".pi", "agent-tool-description.md"),
+        "GUIDE: {{modelSelectionGuide}}\nTABLE: {{modelCandidates}}",
+      );
+    });
+    const tool = tools.get("Agent");
+    expect(tool.description).toContain("GUIDE: AUTO: normally omit model and thinking");
+    expect(tool.parameters.properties.model.description).toContain("Normally omit to let Jev fill unspecified fields");
+    expect(tool.parameters.properties.model.description).toContain("no child starts: model_selection_required");
+    expect(tool.parameters.properties.model.description).toContain("call Agent again");
+    expect(tool.parameters.properties.thinking.description).toContain("Omit to let Jev select unspecified effort");
+  });
+
   it("{{isolationGuideline}} expands to the isolation bullet when worktrees are on (default)", () => {
     const tools = setup({ toolDescriptionMode: "custom" }, () => {
       writeFileSync(join(tmpDir, ".pi", "agent-tool-description.md"), "RULES:{{isolationGuideline}}\nEND");
@@ -236,7 +279,7 @@ describe("toolDescriptionMode", () => {
     const tools = setup({ toolDescriptionMode: "custom" }, () => {
       writeFileSync(
         join(tmpDir, ".pi", "agent-tool-description.md"),
-        "A {{typeList}} B {{compactTypeList}} C {{agentDir}} D {{scheduleGuideline}} E {{isolationGuideline}} F",
+        "A {{typeList}} B {{compactTypeList}} C {{agentDir}} D {{scheduleGuideline}} E {{isolationGuideline}} F {{modelSelectionGuide}} G {{modelCandidates}} H",
       );
     });
     const desc: string = tools.get("Agent").description;

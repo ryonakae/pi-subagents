@@ -39,6 +39,7 @@ export interface WorkflowTask {
   workflowName?: string;
   /** The `tool_use_id` of the call that started this, when one did. */
   toolCallId?: string;
+  parentSessionId?: string;
 
   /**
    * Pause, skip and retry, once the run is up.
@@ -259,7 +260,7 @@ export function resolveResumeTarget(
           : "Nothing has run yet — call this without `resumeFromRunId`."),
     };
   }
-  if (prior.status === "running") {
+  if (prior.status === "running" || prior.status === "paused") {
     return {
       ok: false,
       message: `Workflow "${id}" is still running. Stop it from /agents → Workflows before resuming it.`,

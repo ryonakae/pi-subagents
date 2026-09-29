@@ -17,9 +17,10 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Worker } from "node:worker_threads";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AgentManager } from "../src/agent-manager.js";
+import { AgentManager } from "../src/agent-manager.js";
 import { SUBAGENT_TOOL_NAMES } from "../src/agent-runner.js";
 import { NO_FALLBACK, registerAgents, setFallbackSubagent } from "../src/agent-types.js";
 import subagentsExtension, { WORKFLOW_ENTRY_TYPE, WORKFLOW_FILE_FLAG } from "../src/index.js";
@@ -981,7 +982,8 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
 
   const startedTaskId = (result: unknown) => /Task ID: (\S+)/.exec(textOf(result))![1];
 
-  it("kills a still-running workflow (and its worker thread) on session shutdown", async () => {
+  it("kills a still-running workflow without notifying a departed parent on shutdown", async () => {
+    const terminate = vi.spyOn(Worker.prototype, "terminate");
     // A never-returning script: only the run's own abort signal can stop it, so
     // abortAll() over the agent records would leave the worker spinning.
     const result = await tools.get("SubagentWorkflow").execute(
@@ -992,8 +994,10 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
 
     await booted.lifecycle.get("session_shutdown")?.({}, workflowCtx());
 
-    const sent = await awaitNotification(startedTaskId(result));
-    expect(String(sent[0].content)).toContain("<status>Stopped</status>");
+    expect(terminate).toHaveBeenCalled();
+    await Promise.all(terminate.mock.results.map(call => call.value));
+    await flush();
+    expect(booted.pi.sendMessage.mock.calls.some((call: any[]) => String(call[0]?.content).includes(startedTaskId(result)))).toBe(false);
   });
 
   it("reports a script that threw, rather than a run that quietly ended", async () => {
@@ -1023,6 +1027,150 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
     const sent = await awaitNotification(startedTaskId(result));
     expect(String(sent[0].content)).toContain("control characters");
     expect(sent[0].details).toMatchObject({ status: "error" });
+  });
+});
+
+describe("SubagentWorkflow parent routing", () => {
+  let hermetic: Hermetic;
+  let booted: ReturnType<typeof makePi>;
+  let context: ReturnType<typeof ctx>;
+  const models = [
+    { provider: "test", id: "small", name: "Small", reasoning: true },
+    { provider: "test", id: "large", name: "Large", reasoning: true },
+  ];
+
+  beforeEach(async () => {
+    hermetic = hermeticDir({
+      settings: { schedulingEnabled: false, workflowsEnabled: true },
+      agentFiles: {
+        pinned: "---\nmodel: test/small\nthinking: low\n---\nPinned.\n",
+        modelonly: "---\nmodel: test/small\n---\nPinned model.\n",
+        effortonly: "---\nthinking: low\n---\nPinned effort.\n",
+      },
+    });
+    const agentDir = process.env.PI_CODING_AGENT_DIR!;
+    writeFileSync(join(agentDir, "subagents.json"), JSON.stringify({ jev: { enabled: true, candidates: [] } }));
+    writeFileSync(join(agentDir, "model-selection-guide.md"), "Choose appropriately.");
+    writeFileSync(join(agentDir, "model-selection-auto-guide.md"), "Omit model and effort.");
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Unexpected HTTP request"));
+    booted = makePi();
+    context = ctx({ cwd: hermetic.dir, model: models[1], modelRegistry: {
+      find: (provider: string, id: string) => models.find(model => model.provider === provider && model.id === id),
+      getAvailable: () => models,
+    } });
+    subagentsExtension(booted.pi);
+    await booted.lifecycle.get("session_start")({}, context);
+  });
+
+  afterEach(async () => {
+    await booted.lifecycle.get("session_shutdown")({}, context);
+    await flush();
+    hermetic.restore();
+    vi.restoreAllMocks();
+  });
+
+  const execute = (params: unknown, callContext = context) =>
+    booted.tools.get("SubagentWorkflow").execute("routing", params, undefined, undefined, callContext);
+  const notices = () => booted.pi.sendMessage.mock.calls.filter((call: any[]) =>
+    call[0].customType === "workflow-model-selection-required");
+
+  it.each(["modelonly", "effortonly"])("preserves %s pins when the parent fills the remaining field", async agentType => {
+    const spawn = vi.spyOn(AgentManager.prototype, "spawnAndWait").mockImplementation(async (_pi, _ctx, _type, prompt, options) => {
+      expect(options?.model?.id).toBe("small");
+      expect(options?.thinkingLevel).toBe("low");
+      return { id: prompt, record: record({ id: prompt, result: prompt }) };
+    });
+    const started = await execute({ script: inlineScript + `return await agent('wait', { agentType: '${agentType}' });` });
+    const runId = started.details.taskId;
+    await vi.waitFor(() => expect(notices()).toHaveLength(1));
+    const onlyModel = agentType === "modelonly";
+    expect(notices()[0][0].details).toMatchObject({
+      missing: [onlyModel ? "effort" : "model"],
+      fixed: onlyModel ? { model: "test/small" } : { effort: "low" },
+    });
+    const route = (decision: Record<string, string>) => execute({ action: "route", runId, decisions: [{ agentId: "wf-agent-0", ...decision }] });
+    await expect(route(onlyModel ? { model: "test/large", effort: "low" } : { model: "test/small", effort: "high" }))
+      .rejects.toThrow(/conflicts with the fixed/);
+    expect(spawn).not.toHaveBeenCalled();
+    await route(onlyModel ? { effort: "low" } : { model: "test/small" });
+    await vi.waitFor(() => expect(spawn).toHaveBeenCalledTimes(1));
+  });
+
+  it("checks parent decisions against model scope, not Jev's empty candidate list", async () => {
+    setScopeModelsEnabled(true);
+    writeFileSync(join(hermetic.dir, ".pi", "settings.json"), JSON.stringify({ enabledModels: ["test/small"] }));
+    const spawn = vi.spyOn(AgentManager.prototype, "spawnAndWait").mockImplementation(async (_pi, _ctx, _type, prompt) =>
+      ({ id: prompt, record: record({ id: prompt, result: prompt }) }));
+    try {
+      const started = await execute({ script: inlineScript + "return await agent('wait');" });
+      await vi.waitFor(() => expect(notices()).toHaveLength(1));
+      const route = (model: string) => execute({ action: "route", runId: started.details.taskId,
+        decisions: [{ agentId: "wf-agent-0", model, effort: "low" }] });
+      await expect(route("test/large")).rejects.toThrow(/scope|enabledModels/);
+      expect(spawn).not.toHaveBeenCalled();
+      await route("test/small");
+      await vi.waitFor(() => expect(spawn).toHaveBeenCalledTimes(1));
+    } finally { setScopeModelsEnabled(false); }
+  });
+
+  it("rejects wrong sessions, live replay, and invalid batches without consuming valid decisions", async () => {
+    const spawn = vi.spyOn(AgentManager.prototype, "spawnAndWait").mockImplementation(async (_pi, _ctx, _type, prompt) =>
+      ({ id: prompt, record: record({ id: prompt, result: prompt }) }));
+    const started = await execute({ script: inlineScript + "return await parallel([() => agent('one'), () => agent('two')]);" });
+    const runId = started.details.taskId;
+    await vi.waitFor(() => expect(notices()).toHaveLength(2));
+    const first = { agentId: "wf-agent-0", model: "test/small", effort: "low" };
+    const second = { agentId: "wf-agent-1", model: "test/large", effort: "high" };
+    const route = (decisions: unknown[]) => execute({ action: "route", runId, decisions });
+    await expect(execute({ action: "route", runId, decisions: [first] }, ctx({ sessionManager: { getSessionId: () => "other" } }))).rejects.toThrow(/parent session/);
+    expect(textOf(await execute({ resumeFromRunId: runId }))).toMatch(/still running/);
+    for (const decisions of [[], [first, first], [first, { ...second, agentId: "stale" }],
+      [first, { agentId: second.agentId }], [first, { ...second, model: "unknown/nope" }],
+      [first, { ...second, effort: "nonsense" }]]) {
+      await expect(route(decisions)).rejects.toThrow();
+      expect(spawn).not.toHaveBeenCalled();
+    }
+    expect((await route([first, second])).details.agentIds).toEqual([first.agentId, second.agentId]);
+    await vi.waitFor(() => expect(spawn).toHaveBeenCalledTimes(2));
+  });
+
+  it("cancels selection on session switch and rejects late decisions", async () => {
+    const spawn = vi.spyOn(AgentManager.prototype, "spawnAndWait");
+    const started = await execute({ script: inlineScript + "return await agent('waiting');" });
+    const runId = started.details.taskId;
+    await vi.waitFor(() => expect(notices()).toHaveLength(1));
+    booted.pi.sendMessage.mockClear();
+    await booted.lifecycle.get("session_before_switch")({}, context);
+    await booted.lifecycle.get("session_start")({}, ctx({ ...context, sessionManager: { getSessionId: () => "new-session" } }));
+    await expect(execute({ action: "route", runId, decisions: [{ agentId: "wf-agent-0", model: "test/small", effort: "low" }] })).rejects.toThrow(/live/);
+    await flush();
+    expect(spawn).not.toHaveBeenCalled();
+    expect(booted.pi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("notifies the actual parent, keeps independent work, and routes only the waiting child in the same run", async () => {
+    const starts: string[] = [];
+    vi.spyOn(AgentManager.prototype, "spawnAndWait").mockImplementation(async (_pi, _ctx, _type, prompt, options) => {
+      starts.push(prompt);
+      expect(options?.model?.id).toBe("small");
+      expect(options?.thinkingLevel).toBe("low");
+      return { id: prompt, record: record({ id: prompt, result: prompt }) };
+    });
+    const started = await execute({ script: inlineScript +
+      "return await parallel([() => agent('waiting'), () => agent('fixed', { agentType: 'pinned', model: 'test/large', effort: 'high', gate: 'verify' })]);" });
+    const runId = started.details.taskId;
+    await vi.waitFor(() => expect(notices()).toHaveLength(1));
+    await vi.waitFor(() => expect(booted.pi.exec).toHaveBeenCalledTimes(1));
+    expect(starts).toEqual(["fixed"]);
+    const [message, delivery] = notices()[0];
+    expect(delivery).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    expect(message.details).toMatchObject({ status: "model_selection_required", runId, agentId: "wf-agent-0", missing: ["model", "effort"] });
+    const routed = await execute({ action: "route", runId, decisions: [{ agentId: "wf-agent-0", model: "test/small", effort: "low" }] });
+    expect(routed.details).toEqual({ status: "routed", runId, agentIds: ["wf-agent-0"] });
+    await vi.waitFor(() => expect(starts).toEqual(["fixed", "waiting"]));
+    expect(booted.pi.exec).toHaveBeenCalledTimes(1);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+    await expect(execute({ action: "route", runId, decisions: [{ agentId: "wf-agent-0", model: "test/small", effort: "low" }] })).rejects.toThrow(/stale|live/);
   });
 });
 

@@ -226,7 +226,7 @@ export const meta = {
 | `resumeFromRunId` | string | Replay an earlier run in this session. Matches `^wf_[a-z0-9-]{6,}$` |
 | `title` / `description` | string | Accepted and ignored — for Claude Code parity, so a ported call does not fail. A workflow is named by its `meta` block |
 
-At least one of `script` / `scriptPath` / `name` is required; `scriptPath` wins over `script`, which wins over `name`.
+To start a run, at least one of `script` / `scriptPath` / `name` is required; `scriptPath` wins over `script`, which wins over `name`.
 
 ### `agent(prompt, opts?)`
 
@@ -239,8 +239,8 @@ Spawns one subagent and resolves to its final text — or, with `schema`, to a v
 | `label` | string | Display name in the progress tree. Also the handle `resume` addresses |
 | `phase` | string | Put this agent in a named group, overriding the ambient `phase()`. **Use it inside `pipeline`/`parallel` stages**, where the ambient phase races |
 | `agentType` | string | Which agent definition to use. Defaults to `general-purpose`; built-ins are `general-purpose`, `Explore`, `Plan`, plus your custom agents |
-| `model` | string | `provider/modelId`, or fuzzy like `haiku` |
-| `effort` | string | `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Omitted, the agent definition's own `thinking` decides, then the parent's |
+| `model` | string | `provider/modelId`, or fuzzy like `haiku`. The agent definition wins; an explicit value fills only an unpinned model and automatic selection never overwrites it |
+| `effort` | string | Workflow's name for the Agent tool's `thinking`: `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. The definition's `thinking` wins; an explicit value fills its gap. Jev fills remaining gaps when enabled; if it cannot, the actual parent must decide before launch. Only explicit Jev off permits parent inheritance |
 | `isolation` | `"worktree"` | Run in a throwaway git worktree. Only when agents write files in parallel and would collide — it costs setup time and disk per agent |
 | `gate` | string | A shell command run after the agent finishes; a non-zero exit fails the agent and its output becomes the error |
 | `resume` | string | Continue the child that ran under that label instead of starting fresh |
@@ -308,7 +308,27 @@ A run's concurrency limit is its own, independent of the session's `maxConcurren
 
 `workflowsEnabled` is **on**; leaving it unset means *auto*, which is on unless another extension already offers a `Workflow` or `SubagentWorkflow` tool, in which case this one stands down for the session. Setting it explicitly pins it. See [Persistent settings](../README.md#persistent-settings).
 
+Global-only [Jev model selection](../README.md#persistent-settings) applies to each new `agent()` call when `model` or `effort` is omitted. In Workflow scripts, `effort` is the same concept the Agent tool calls `thinking`. Definitions win, explicit values fill their gaps, then Jev fills unspecified fields. Resume calls are not reselected. Jev abstention or failure waits for the actual parent rather than inheriting.
+
 `pi --subagents-workflow-file=<path>` runs a workflow at startup, including headless under `pi -p`. Use the `=` form — the bare `--flag value` spelling swallows the next argument. See [CLI flags](../README.md#cli-flags).
+
+### Parent model selection
+
+When Jev is enabled but cannot choose, the child does not start. The original parent receives a `workflow-model-selection-required` custom message via `followUp` with `triggerTurn: true`. Its text and details include `status: "model_selection_required"`, `runId`, `agentId`, `label`, `agentType`, `prompt` (at most 2,000 characters), `missing`, `fixed`, `reason`, `guide`, and `scriptPath`. Read the script for task context omitted from the preview, then choose only the missing fields:
+
+```js
+SubagentWorkflow({
+  action: "route",
+  runId: "<notified runId>",
+  decisions: [{ agentId: "<notified agentId>", model: "provider/modelId", effort: "low" }],
+})
+```
+
+The result is `{status: "routed", runId, agentIds}`. All decisions in a batch must pass validation before any is accepted. Missing fields, invalid/unsupported choices, fixed-value conflicts, duplicate IDs, and stale or unknown IDs are rejected without consuming pending decisions. Models use the normal registry and `scopeModels` policy, not a new allowlist derived from Jev candidates.
+
+Only the affected `agent()` promise waits. Independent jobs and gates continue; completed work is not rerun. Selector work remains concurrency-limited, waits release their permits, and accepted choices reacquire a permit before spawning. A paused run stays paused after routing. Skip or stop cancels a wait, and session switch/shutdown invalidates it. If the parent notification cannot be delivered, the agent fails without spawning. Pending choices are not restored after crash/reload.
+
+Do not precompute fallback values, rerun the script, or use `resumeFromRunId` to resolve a selection wait. Live runs (including paused runs) cannot be journal-replayed. Use the inspector to unpause; journal replay is for finished runs.
 
 ## Recipes
 

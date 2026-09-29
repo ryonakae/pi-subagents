@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import { inChildSessionContext, runInChildSessionContext } from "../src/child-context.js";
+import {
+  CHILD_CONTEXT_KEY,
+  getChildContextAccessor,
+  inChildSessionContext,
+  runInChildSessionContext,
+} from "../src/child-context.js";
 import subagentsExtension from "../src/index.js";
 
 describe("child session async context", () => {
@@ -11,6 +16,30 @@ describe("child session async context", () => {
       expect(inChildSessionContext()).toBe(true);
     });
     expect(inChildSessionContext()).toBe(false);
+  });
+
+  it("publishes one read-only versioned accessor for cross-extension consumers", () => {
+    const accessor = getChildContextAccessor();
+    expect(accessor).toBe((globalThis as Record<symbol, unknown>)[CHILD_CONTEXT_KEY]);
+    expect(accessor).toEqual({ version: 1, isChildSession: expect.any(Function) });
+    expect(Object.isFrozen(accessor)).toBe(true);
+    expect(getChildContextAccessor()).toBe(accessor);
+  });
+
+  it("does not share child state with concurrent main work", async () => {
+    let releaseChild!: () => void;
+    const held = new Promise<void>(resolve => { releaseChild = resolve; });
+    const child = runInChildSessionContext(async () => {
+      expect(getChildContextAccessor().isChildSession()).toBe(true);
+      await held;
+      expect(getChildContextAccessor().isChildSession()).toBe(true);
+    });
+
+    await Promise.resolve();
+    expect(getChildContextAccessor().isChildSession()).toBe(false);
+    releaseChild();
+    await child;
+    expect(getChildContextAccessor().isChildSession()).toBe(false);
   });
 
   it("prevents a child resource load from creating another extension manager", async () => {
