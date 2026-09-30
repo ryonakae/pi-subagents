@@ -239,6 +239,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
           fixedEffort,
           enabledModels,
           signal,
+          getOpenRouterApiKey: () => ctx.modelRegistry.getApiKeyForProvider("openrouter"),
         });
         signal?.throwIfAborted();
         if (selection.kind === "fallback" && deps.jev.config.enabled) {

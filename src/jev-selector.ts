@@ -2,7 +2,10 @@ import { getSupportedThinkingLevels, type ThinkingLevel } from "@earendil-works/
 import type { ModelRegistry } from "./model-resolver.js";
 import type { JevCandidate, JevSettings } from "./settings.js";
 
-const TYPESAFE_ENDPOINT = "https://api.typesafe.ai/v1/systemone";
+const JEV_ENDPOINTS = {
+  typesafe: "https://api.typesafe.ai/v1/systemone",
+  openrouter: "https://openrouter.ai/api/v1/systemone",
+} as const;
 const ABSTAIN_ID = "abstain";
 const MAX_CHOICE_OPTIONS = 255;
 
@@ -16,6 +19,7 @@ export interface JevSelectorInput {
   fixedEffort?: ThinkingLevel;
   enabledModels?: ReadonlySet<string>;
   signal?: AbortSignal;
+  getOpenRouterApiKey?: () => Promise<string | undefined>;
   fetch?: typeof fetch;
 }
 
@@ -57,11 +61,6 @@ export async function selectJevCandidate(input: JevSelectorInput): Promise<JevSe
     };
   }
 
-  const apiKey = process.env.TYPESAFE_API_KEY;
-  if (!apiKey) {
-    return { kind: "fallback", warning: "Jev model selection skipped: TYPESAFE_API_KEY is not set." };
-  }
-
   const criteria: Record<string, unknown> = {};
   const candidates = eligible.map(({ candidate }, index) => {
     const id = candidateId(index);
@@ -88,6 +87,29 @@ export async function selectJevCandidate(input: JevSelectorInput): Promise<JevSe
     };
   }
 
+  let apiKey: string | undefined;
+  if (input.config.provider === "openrouter") {
+    if (input.signal?.aborted) throw input.signal.reason ?? new Error("Jev selection aborted");
+    if (input.getOpenRouterApiKey === undefined) {
+      return { kind: "fallback", warning: "Jev model selection skipped: OpenRouter authentication is unavailable." };
+    }
+    try {
+      apiKey = await input.getOpenRouterApiKey();
+    } catch {
+      if (input.signal?.aborted) throw input.signal.reason ?? new Error("Jev selection aborted");
+      return { kind: "fallback", warning: "Jev model selection failed: OpenRouter authentication could not be resolved." };
+    }
+    if (input.signal?.aborted) throw input.signal.reason ?? new Error("Jev selection aborted");
+    if (!apiKey) {
+      return { kind: "fallback", warning: "Jev model selection skipped: OpenRouter authentication is unavailable." };
+    }
+  } else {
+    apiKey = process.env.TYPESAFE_API_KEY;
+    if (!apiKey) {
+      return { kind: "fallback", warning: "Jev model selection skipped: TYPESAFE_API_KEY is not set." };
+    }
+  }
+
   const controller = new AbortController();
   let timedOut = false;
   const timeout = setTimeout(() => {
@@ -99,7 +121,7 @@ export async function selectJevCandidate(input: JevSelectorInput): Promise<JevSe
   else input.signal?.addEventListener("abort", onAbort, { once: true });
 
   try {
-    const response = await (input.fetch ?? fetch)(TYPESAFE_ENDPOINT, {
+    const response = await (input.fetch ?? fetch)(JEV_ENDPOINTS[input.config.provider], {
       method: "POST",
       redirect: "error",
       headers: {

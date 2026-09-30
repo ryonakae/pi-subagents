@@ -17,6 +17,7 @@ const opus = {
 
 const baseConfig = (overrides: Partial<JevSettings> = {}): JevSettings => ({
   enabled: true,
+  provider: "typesafe",
   model: "jev-1.13.0",
   timeoutMs: 5000,
   minConfidence: 0.7,
@@ -63,54 +64,63 @@ function choiceResponse(choice: string, confidence = 0.9): Response {
 describe("Jev model selector", () => {
   it("makes no request while disabled", async () => {
     const fetchFn = vi.fn();
+    const getOpenRouterApiKey = vi.fn(async () => "unused-secret");
 
     const result = await selectJevCandidate({
       task: "Inspect the authentication flow",
       role: "Read-only explorer",
       guide: "Prefer the least expensive candidate that can complete the task.",
-      config: baseConfig({ enabled: false }),
+      config: baseConfig({ enabled: false, provider: "openrouter", model: "typesafe/jev-1.13" }),
       registry,
+      getOpenRouterApiKey,
       fetch: fetchFn,
     });
 
     expect(result).toEqual({ kind: "fallback" });
+    expect(getOpenRouterApiKey).not.toHaveBeenCalled();
     expect(fetchFn).not.toHaveBeenCalled();
   });
 
   it("makes no request when model and effort are both fixed", async () => {
     const fetchFn = vi.fn();
+    const getOpenRouterApiKey = vi.fn(async () => "unused-secret");
 
     const result = await selectJevCandidate({
       task: "Implement the parser",
       role: "General implementation agent",
       guide: "Choose conservatively.",
-      config: baseConfig(),
+      config: baseConfig({ provider: "openrouter", model: "typesafe/jev-1.13" }),
       registry,
       fixedModel: sonnet,
       fixedEffort: "low",
+      getOpenRouterApiKey,
       fetch: fetchFn,
     });
 
     expect(result).toEqual({ kind: "fixed" });
+    expect(getOpenRouterApiKey).not.toHaveBeenCalled();
     expect(fetchFn).not.toHaveBeenCalled();
   });
 
   it("falls back without a request when no candidate survives availability, scope, and fixed constraints", async () => {
     const fetchFn = vi.fn();
+    const getOpenRouterApiKey = vi.fn(async () => "unused-secret");
 
     const result = await selectJevCandidate({
       task: "Review the API",
       role: "Reviewer",
       guide: "Choose conservatively.",
-      config: baseConfig(),
+      config: baseConfig({ provider: "openrouter", model: "typesafe/jev-1.13" }),
       registry,
       fixedEffort: "max",
       enabledModels: new Set(["anthropic/claude-sonnet-4-6"]),
+      getOpenRouterApiKey,
       fetch: fetchFn,
     });
 
     expect(result.kind).toBe("fallback");
     expect(result).toMatchObject({ warning: expect.stringContaining("no eligible candidates") });
+    expect(getOpenRouterApiKey).not.toHaveBeenCalled();
     expect(fetchFn).not.toHaveBeenCalled();
   });
 
@@ -133,14 +143,16 @@ describe("Jev model selector", () => {
 
   it("selects one eligible candidate deterministically without a request", async () => {
     const fetchFn = vi.fn();
+    const getOpenRouterApiKey = vi.fn(async () => "unused-secret");
 
     const result = await selectJevCandidate({
       task: "Review the API",
       role: "Reviewer",
       guide: "Choose conservatively.",
-      config: baseConfig(),
+      config: baseConfig({ provider: "openrouter", model: "typesafe/jev-1.13" }),
       registry,
       fixedModel: opus,
+      getOpenRouterApiKey,
       fetch: fetchFn,
     });
 
@@ -151,6 +163,7 @@ describe("Jev model selector", () => {
       effort: "high",
       source: "deterministic",
     });
+    expect(getOpenRouterApiKey).not.toHaveBeenCalled();
     expect(fetchFn).not.toHaveBeenCalled();
   });
 
@@ -216,6 +229,110 @@ describe("Jev model selector", () => {
     }
   });
 
+  it("uses Pi OpenRouter authentication and the fixed OpenRouter SystemOne endpoint", async () => {
+    const getOpenRouterApiKey = vi.fn(async () => "openrouter-synthetic-secret");
+    const fetchFn = vi.fn(async () => choiceResponse("candidate_2"));
+
+    const result = await selectJevCandidate({
+      task: "Route this task",
+      role: "Reviewer",
+      guide: "Choose conservatively.",
+      config: baseConfig({ provider: "openrouter", model: "typesafe/jev-1.13" }),
+      registry,
+      getOpenRouterApiKey,
+      fetch: fetchFn,
+    });
+
+    expect(result).toMatchObject({ kind: "selected", modelId: "anthropic/claude-opus-4-6" });
+    expect(getOpenRouterApiKey).toHaveBeenCalledOnce();
+    expect(fetchFn).toHaveBeenCalledOnce();
+    expect(fetchFn.mock.calls[0]?.[0]).toBe("https://openrouter.ai/api/v1/systemone");
+    expect(fetchFn.mock.calls[0]?.[1]).toMatchObject({
+      headers: { Authorization: "Bearer openrouter-synthetic-secret" },
+    });
+    expect(JSON.parse(String(fetchFn.mock.calls[0]?.[1]?.body))).toMatchObject({ model: "typesafe/jev-1.13" });
+  });
+
+  it("does not consult Pi OpenRouter authentication for TypeSafe", async () => {
+    await withApiKey(async () => {
+      const getOpenRouterApiKey = vi.fn(async () => "wrong-secret");
+      const fetchFn = vi.fn(async () => choiceResponse("candidate_2"));
+
+      await selectJevCandidate({
+        task: "Route this task",
+        role: "Reviewer",
+        guide: "Choose conservatively.",
+        config: baseConfig(),
+        registry,
+        getOpenRouterApiKey,
+        fetch: fetchFn,
+      });
+
+      expect(getOpenRouterApiKey).not.toHaveBeenCalled();
+      expect(fetchFn.mock.calls[0]?.[0]).toBe("https://api.typesafe.ai/v1/systemone");
+      expect(fetchFn.mock.calls[0]?.[1]).toMatchObject({
+        headers: { Authorization: "Bearer test-secret" },
+      });
+    });
+  });
+
+  it("does not reuse TypeSafe credentials when OpenRouter authentication is unavailable", async () => {
+    await withApiKey(async () => {
+      const fetchFn = vi.fn();
+      const result = await selectJevCandidate({
+        task: "Route this task",
+        role: "Reviewer",
+        guide: "Choose conservatively.",
+        config: baseConfig({ provider: "openrouter", model: "typesafe/jev-1.13" }),
+        registry,
+        fetch: fetchFn,
+      });
+
+      expect(result).toMatchObject({ kind: "fallback", warning: expect.stringContaining("OpenRouter authentication") });
+      expect(fetchFn).not.toHaveBeenCalled();
+    });
+  });
+
+  it("redacts OpenRouter authentication errors and sends no request", async () => {
+    const fetchFn = vi.fn();
+    const result = await selectJevCandidate({
+      task: "private task",
+      role: "Reviewer",
+      guide: "Choose conservatively.",
+      config: baseConfig({ provider: "openrouter", model: "typesafe/jev-1.13" }),
+      registry,
+      getOpenRouterApiKey: vi.fn(async () => { throw new Error("raw-auth-secret-sentinel"); }),
+      fetch: fetchFn,
+    });
+
+    expect(result).toMatchObject({ kind: "fallback", warning: expect.stringContaining("OpenRouter authentication") });
+    expect((result as { warning?: string }).warning).not.toContain("raw-auth-secret-sentinel");
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it("does not send after caller abort while OpenRouter authentication is pending", async () => {
+    const controller = new AbortController();
+    let resolveKey: ((key: string) => void) | undefined;
+    const getOpenRouterApiKey = vi.fn(() => new Promise<string>(resolve => { resolveKey = resolve; }));
+    const fetchFn = vi.fn();
+    const selecting = selectJevCandidate({
+      task: "private task",
+      role: "Reviewer",
+      guide: "Choose conservatively.",
+      config: baseConfig({ provider: "openrouter", model: "typesafe/jev-1.13" }),
+      registry,
+      signal: controller.signal,
+      getOpenRouterApiKey,
+      fetch: fetchFn,
+    });
+
+    controller.abort(new Error("cancelled during authentication"));
+    resolveKey?.("late-secret");
+
+    await expect(selecting).rejects.toThrow("cancelled during authentication");
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
   it("falls back on abstention, low confidence, and malformed typed responses without retrying", async () => {
     await withApiKey(async () => {
       for (const response of [
@@ -242,12 +359,14 @@ describe("Jev model selector", () => {
   it("rejects oversized requests and too many Choice options before fetch", async () => {
     await withApiKey(async () => {
       const fetchFn = vi.fn();
+      const getOpenRouterApiKey = vi.fn(async () => "unused-secret");
       const oversized = await selectJevCandidate({
         task: "large task",
         role: "Reviewer",
         guide: "Choose conservatively.",
-        config: baseConfig({ maxRequestBytes: 1 }),
+        config: baseConfig({ provider: "openrouter", model: "typesafe/jev-1.13", maxRequestBytes: 1 }),
         registry,
+        getOpenRouterApiKey,
         fetch: fetchFn,
       });
       expect(oversized).toMatchObject({ kind: "fallback", warning: expect.stringContaining("maxRequestBytes") });
@@ -268,12 +387,16 @@ describe("Jev model selector", () => {
         role: "Reviewer",
         guide: "Choose conservatively.",
         config: baseConfig({
+          provider: "openrouter",
+          model: "typesafe/jev-1.13",
           candidates: models.map(model => ({ model: `${model.provider}/${model.id}`, effort: "low" })),
         }),
         registry: largeRegistry,
+        getOpenRouterApiKey,
         fetch: fetchFn,
       });
       expect(tooMany).toMatchObject({ kind: "fallback", warning: expect.stringContaining("255-option limit") });
+      expect(getOpenRouterApiKey).not.toHaveBeenCalled();
       expect(fetchFn).not.toHaveBeenCalled();
     });
   });

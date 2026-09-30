@@ -34,8 +34,11 @@ export interface JevBenchmarkMetadata {
   priceCheckedAt?: string;
 }
 
+export type JevProvider = "typesafe" | "openrouter";
+
 export interface JevSettings {
   enabled: boolean;
+  provider: JevProvider;
   model: string;
   timeoutMs: number;
   minConfidence: number;
@@ -44,9 +47,15 @@ export interface JevSettings {
   benchmark?: JevBenchmarkMetadata;
 }
 
+const DEFAULT_JEV_MODELS: Readonly<Record<JevProvider, string>> = Object.freeze({
+  typesafe: "jev-1.13.0",
+  openrouter: "typesafe/jev-1.13",
+});
+
 export const DEFAULT_JEV_SETTINGS: Readonly<Omit<JevSettings, "candidates">> = Object.freeze({
   enabled: false,
-  model: "jev-1.13.0",
+  provider: "typesafe",
+  model: DEFAULT_JEV_MODELS.typesafe,
   timeoutMs: 5000,
   minConfidence: 0.7,
   maxRequestBytes: 65_536,
@@ -446,6 +455,7 @@ function sanitizeJev(raw: unknown): JevSettings | undefined {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
   const r = raw as Record<string, unknown>;
   if (r.enabled !== undefined && typeof r.enabled !== "boolean") return undefined;
+  if (r.provider !== undefined && r.provider !== "typesafe" && r.provider !== "openrouter") return undefined;
   if (r.model !== undefined && (typeof r.model !== "string" || !r.model.trim())) return undefined;
   if (r.timeoutMs !== undefined && (!Number.isInteger(r.timeoutMs) || (r.timeoutMs as number) < 1)) return undefined;
   if (r.minConfidence !== undefined && (!isFiniteNumber(r.minConfidence) || r.minConfidence > 1)) return undefined;
@@ -475,9 +485,11 @@ function sanitizeJev(raw: unknown): JevSettings | undefined {
 
   const benchmark = r.benchmark === undefined ? undefined : sanitizeBenchmarkMetadata(r.benchmark);
   if (r.benchmark !== undefined && benchmark === undefined) return undefined;
+  const provider = (r.provider ?? DEFAULT_JEV_SETTINGS.provider) as JevProvider;
   return {
     enabled: r.enabled ?? DEFAULT_JEV_SETTINGS.enabled,
-    model: typeof r.model === "string" ? r.model.trim() : DEFAULT_JEV_SETTINGS.model,
+    provider,
+    model: typeof r.model === "string" ? r.model.trim() : DEFAULT_JEV_MODELS[provider],
     timeoutMs: typeof r.timeoutMs === "number" ? r.timeoutMs : DEFAULT_JEV_SETTINGS.timeoutMs,
     minConfidence: typeof r.minConfidence === "number" ? r.minConfidence : DEFAULT_JEV_SETTINGS.minConfidence,
     maxRequestBytes: typeof r.maxRequestBytes === "number" ? r.maxRequestBytes : DEFAULT_JEV_SETTINGS.maxRequestBytes,

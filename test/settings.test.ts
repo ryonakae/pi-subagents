@@ -69,6 +69,7 @@ describe("settings persistence", () => {
   it("loads a valid Jev configuration from global settings only", () => {
     const jev = {
       enabled: true,
+      provider: "typesafe",
       model: "jev-1.13.0",
       timeoutMs: 5000,
       minConfidence: 0.7,
@@ -100,6 +101,46 @@ describe("settings persistence", () => {
     writeGlobal({ jev });
 
     expect(loadSettings(projectDir).jev).toEqual(jev);
+  });
+
+  it.each([
+    [undefined, "typesafe", "jev-1.13.0"],
+    ["typesafe", "typesafe", "jev-1.13.0"],
+    ["openrouter", "openrouter", "typesafe/jev-1.13"],
+  ] as const)("defaults Jev provider %s to %s with model %s", (provider, expectedProvider, expectedModel) => {
+    writeGlobal({ jev: { enabled: true, ...(provider !== undefined ? { provider } : {}), candidates: [] } });
+
+    expect(loadSettings(projectDir).jev).toMatchObject({
+      provider: expectedProvider,
+      model: expectedModel,
+    });
+  });
+
+  it("preserves an explicit Jev model when the provider changes", () => {
+    writeGlobal({ jev: { enabled: true, provider: "openrouter", model: "custom/jev", candidates: [] } });
+
+    expect(loadSettings(projectDir).jev).toMatchObject({ provider: "openrouter", model: "custom/jev" });
+  });
+
+  it.each([
+    ["unknown string", "secret-provider"],
+    ["null", null],
+    ["boolean", false],
+    ["number", 42],
+    ["object", { value: "secret-provider" }],
+    ["array", ["secret-provider"]],
+  ] as const)("rejects a %s Jev provider without exposing its value", (_label, provider) => {
+    writeGlobal({ jev: { enabled: true, provider, candidates: [] } });
+    const spy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(loadSettings(projectDir).jev).toBeUndefined();
+      expect(spy).toHaveBeenCalledOnce();
+      expect(spy.mock.calls[0]?.[0]).toBe(
+        `[pi-subagents] Ignoring invalid Jev settings at ${globalFile()}; Jev model selection is disabled.`,
+      );
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("warns without exposing raw values and disables invalid global Jev settings", () => {
@@ -170,6 +211,7 @@ describe("settings persistence", () => {
     const settings = {
       jev: {
         enabled: true,
+        provider: "typesafe" as const,
         model: "jev-1.13.0",
         timeoutMs: 5000,
         minConfidence: 0.7,

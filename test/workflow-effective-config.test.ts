@@ -116,6 +116,7 @@ describe("the workflow host reports a child's effective configuration", () => {
       jev: {
         config: {
           enabled: true,
+          provider: "typesafe",
           model: "jev-1.13.0",
           timeoutMs: 5000,
           minConfidence: 0.7,
@@ -135,6 +136,122 @@ describe("the workflow host reports a child's effective configuration", () => {
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
+  });
+
+  it("uses the Workflow session's Pi OpenRouter authentication for Jev", async () => {
+    const getApiKeyForProvider = vi.fn(async () => "workflow-openrouter-secret");
+    const haiku = {
+      provider: "anthropic",
+      id: "claude-haiku-4-5",
+      name: "Haiku 4.5",
+      reasoning: true,
+    };
+    const opus = {
+      provider: "anthropic",
+      id: "claude-opus-4-6",
+      name: "Opus 4.6",
+      reasoning: true,
+    };
+    const http = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      answers: {
+        selection: {
+          type: "choice",
+          choice: "candidate_1",
+          confidence: 0.9,
+          probabilities: { candidate_1: 0.9, candidate_2: 0.05, abstain: 0.05 },
+        },
+      },
+    }), { status: 200 }));
+    childSessionReports({ model: haiku, thinkingLevel: "low" });
+    const host = createWorkflowHost({
+      pi,
+      ctx: ctx({
+        modelRegistry: {
+          find: vi.fn((_provider: string, id: string) => [haiku, opus].find(model => model.id === id)),
+          getAvailable: vi.fn(() => [haiku, opus]),
+          getApiKeyForProvider,
+        },
+      }),
+      manager,
+      jev: {
+        config: {
+          enabled: true,
+          provider: "openrouter",
+          model: "typesafe/jev-1.13",
+          timeoutMs: 5000,
+          minConfidence: 0.7,
+          maxRequestBytes: 65_536,
+          candidates: [
+            { model: "anthropic/claude-haiku-4-5", effort: "low" },
+            { model: "anthropic/claude-opus-4-6", effort: "high" },
+          ],
+        },
+        guide: "Choose conservatively.",
+      },
+    });
+
+    await host.spawnAgent(spawnRequest());
+
+    expect(getApiKeyForProvider).toHaveBeenCalledOnce();
+    expect(getApiKeyForProvider).toHaveBeenCalledWith("openrouter");
+    expect(http.mock.calls[0]?.[0]).toBe("https://openrouter.ai/api/v1/systemone");
+    expect(vi.mocked(runAgent).mock.calls[0]?.[3]).toMatchObject({ model: haiku, thinkingLevel: "low" });
+    http.mockRestore();
+  });
+
+  it("falls back to Workflow parent selection without leaking a Pi OpenRouter authentication error", async () => {
+    const haiku = {
+      provider: "anthropic",
+      id: "claude-haiku-4-5",
+      name: "Haiku 4.5",
+      reasoning: true,
+    };
+    const opus = {
+      provider: "anthropic",
+      id: "claude-opus-4-6",
+      name: "Opus 4.6",
+      reasoning: true,
+    };
+    const getApiKeyForProvider = vi.fn(async () => {
+      throw new Error("raw-workflow-auth-secret-sentinel");
+    });
+    vi.mocked(runAgent).mockClear();
+    const http = vi.spyOn(globalThis, "fetch");
+    const host = createWorkflowHost({
+      pi,
+      ctx: ctx({
+        modelRegistry: {
+          find: vi.fn((_provider: string, id: string) => [haiku, opus].find(model => model.id === id)),
+          getAvailable: vi.fn(() => [haiku, opus]),
+          getApiKeyForProvider,
+        },
+      }),
+      manager,
+      jev: {
+        config: {
+          enabled: true,
+          provider: "openrouter",
+          model: "typesafe/jev-1.13",
+          timeoutMs: 5000,
+          minConfidence: 0.7,
+          maxRequestBytes: 65_536,
+          candidates: [
+            { model: "anthropic/claude-haiku-4-5", effort: "low" },
+            { model: "anthropic/claude-opus-4-6", effort: "high" },
+          ],
+        },
+        guide: "Choose conservatively.",
+      },
+    });
+
+    const result = await host.spawnAgent(spawnRequest());
+
+    expect(getApiKeyForProvider).toHaveBeenCalledWith("openrouter");
+    expect(runAgent).not.toHaveBeenCalled();
+    expect(http).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ ok: false, error: expect.stringContaining("Parent model selection") });
+    expect(JSON.stringify(result)).not.toContain("raw-workflow-auth-secret-sentinel");
+    http.mockRestore();
   });
 
   it("does not spawn when the workflow is aborted after Jev selection resolves", async () => {
@@ -159,6 +276,7 @@ describe("the workflow host reports a child's effective configuration", () => {
       jev: {
         config: {
           enabled: true,
+          provider: "typesafe",
           model: "jev-1.13.0",
           timeoutMs: 5000,
           minConfidence: 0.7,
@@ -212,6 +330,7 @@ describe("the workflow host reports a child's effective configuration", () => {
       jev: {
         config: {
           enabled: true,
+          provider: "typesafe",
           model: "jev-1.13.0",
           timeoutMs: 5000,
           minConfidence: 0.7,

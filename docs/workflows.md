@@ -310,6 +310,8 @@ A run's concurrency limit is its own, independent of the session's `maxConcurren
 
 Global-only [Jev model selection](../README.md#persistent-settings) applies to each new `agent()` call when `model` or `effort` is omitted. In Workflow scripts, `effort` is the same concept the Agent tool calls `thinking`. Definitions win, explicit values fill their gaps, then Jev fills unspecified fields. Resume calls are not reselected. Jev abstention or failure waits for the actual parent rather than inheriting.
 
+TypeSafe keeps using `TYPESAFE_API_KEY`. With `jev.provider: "openrouter"`, each run resolves OpenRouter authentication through that Workflow's Pi session immediately before a request; `/login openrouter` and `OPENROUTER_API_KEY` therefore follow Pi's standard precedence. Deterministic, fixed, ineligible, resumed, skipped, or stopped calls do not resolve a credential. Authentication lookup is separate from `timeoutMs`, which starts only for the HTTP request and response body. If the run is stopped while authentication is pending, completion of that lookup cannot start an HTTP request or child.
+
 `pi --subagents-workflow-file=<path>` runs a workflow at startup, including headless under `pi -p`. Use the `=` form — the bare `--flag value` spelling swallows the next argument. See [CLI flags](../README.md#cli-flags).
 
 ### Parent model selection

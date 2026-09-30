@@ -1901,6 +1901,7 @@ Terse command-style prompts produce shallow, generic work.
           fixedEffort: resolvedConfig.thinking,
           enabledModels,
           signal,
+          getOpenRouterApiKey: () => ctx.modelRegistry.getApiKeyForProvider("openrouter"),
         });
         if (signal?.aborted) throw signal.reason ?? new Error("Agent spawn aborted");
         if (selection.kind === "fallback" && jevConfig.enabled) {

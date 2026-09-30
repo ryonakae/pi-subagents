@@ -1,11 +1,12 @@
 # pi-subagents (ryonakae fork)
 
 > **Fork note:** This is an independently maintained fork of [tintinweb/pi-subagents](https://github.com/tintinweb/pi-subagents). The `feat/jev-routing` branch adds:
-> - Jev model/effort selection that returns the decision to the actual parent when Jev declines or cannot select, rather than silently inheriting.
+> - Jev model/effort selection through TypeSafe or OpenRouter that returns the decision to the actual parent when Jev declines or cannot select, rather than silently inheriting.
+> - Pi-standard OpenRouter authentication for both `Agent` and `SubagentWorkflow` routing.
 > - Definition-priority model/effort resolution for both `Agent` and `SubagentWorkflow` calls.
 > - Read-only child-session identification for inline-skills integrations.
 >
-> Jev is off by default (`jev.enabled: false`). Install this branch with `pi install git:github.com/ryonakae/pi-subagents@feat/jev-routing`.
+> Jev is off by default (`jev.enabled: false`) and keeps TypeSafe as its default provider. Install this branch with `pi install git:github.com/ryonakae/pi-subagents@feat/jev-routing`.
 
 A focused fork of [tintinweb/pi-subagents](https://github.com/tintinweb/pi-subagents). It retains upstream's tools and workflow support while fixing completion notifications that arrive after their results have already been consumed in TUI and RPC sessions. The notification fix follows [vincelwt's PR #265](https://github.com/tintinweb/pi-subagents/pull/265).
 
@@ -634,14 +635,17 @@ Runtime tuning values set via `/agents` → Settings (max concurrency, max foreg
 
 **Precedence:** project overrides global on any field present in both, except `jev`, which is global-only and ignored in project settings. Missing fields fall back to the hardcoded defaults (max concurrency `10`, max foreground concurrency `0` = unlimited, default max turns unlimited, grace turns `5`, nested depth `2`, join mode `smart`, defaults enabled).
 
-**Jev model selection** (`jev.enabled`, default `false`): optionally asks [TypeSafe SystemOne](https://typesafe.ai/) to choose a model/thinking pair for a newly spawned top-level `Agent` or Workflow `agent()` call when either value is omitted. Agent frontmatter wins over call values; explicit call values fill only gaps in the definition, and Jev fills the remaining gaps. Invalid fixed model/thinking values stop the launch. With one eligible candidate selection is local and deterministic; with two or more, the selector sends the task, role, selection guide and structured candidate criteria to SystemOne's Choice endpoint. It sends no parent conversation. Set `TYPESAFE_API_KEY` in the environment to enable HTTP selection.
+**Jev model selection** (`jev.enabled`, default `false`): optionally asks SystemOne to choose a model/thinking pair for a newly spawned top-level `Agent` or Workflow `agent()` call when either value is omitted. `jev.provider` is `"typesafe"` (the default) or `"openrouter"`; an unknown value invalidates the Jev settings instead of switching providers. Agent frontmatter wins over call values; explicit call values fill only gaps in the definition, and Jev fills the remaining gaps. Invalid fixed model/thinking values stop the launch. With one eligible candidate selection is local and deterministic; with two or more, the selector sends the task, role, selection guide and structured candidate criteria to the configured provider's SystemOne Choice endpoint. It sends no parent conversation or session metadata.
 
-The setting is accepted only from the global `<agentDir>/subagents.json`; a project's `.pi/subagents.json` cannot enable or alter it, and `/agents` never writes it. Candidate models must use canonical `provider/modelId` identifiers. Candidates are filtered through pi's available model registry, `enabledModels`, any fixed model or effort, and the model's supported thinking levels. With the required guides present, one eligible candidate is used without HTTP. No eligible candidate, Choice abstention, low confidence, timeout, HTTP/JSON/schema error, missing API key, or request-size violation requires an explicit decision from the actual parent before the child starts; it never silently inherits. User cancellation aborts instead of requesting selection. Resume, nested delegation, scheduled jobs and cross-extension RPC keep their existing model behavior.
+TypeSafe uses the fixed `https://api.typesafe.ai/v1/systemone` endpoint, defaults `jev.model` to `jev-1.13.0`, and continues to read `TYPESAFE_API_KEY`. OpenRouter uses the fixed `https://openrouter.ai/api/v1/systemone` endpoint and defaults the model to `typesafe/jev-1.13`. Configure OpenRouter with `/login openrouter` or `OPENROUTER_API_KEY`; the extension delegates lookup to the current Pi session, so Pi's saved credential takes priority over the environment variable. It does not read credential files or implement its own key precedence. Changing provider never reuses the other provider's key and request failures never fail over between providers. An explicit `jev.model` is preserved when `provider` changes.
+
+The setting is accepted only from the global `<agentDir>/subagents.json`; a project's `.pi/subagents.json` cannot enable or alter it, and `/agents` never writes it. Candidate models must use canonical `provider/modelId` identifiers. Candidates are filtered through pi's available model registry, `enabledModels`, any fixed model or effort, and the model's supported thinking levels. With the required guides present, one eligible candidate is used without HTTP or credential lookup. No eligible candidate, Choice abstention, low confidence, timeout, HTTP/JSON/schema error, missing credential, or request-size violation requires an explicit decision from the actual parent before the child starts; it never silently inherits. `timeoutMs` covers the HTTP request and response body, not Pi's preceding authentication lookup; a configured authentication command can take up to Pi's own limit. User cancellation is checked before and after authentication and aborts before the request if it completed while authentication was pending. Resume, nested delegation, scheduled jobs and cross-extension RPC keep their existing model behavior.
 
 ```json
 {
   "jev": {
     "enabled": false,
+    "provider": "typesafe",
     "model": "jev-1.13.0",
     "timeoutMs": 5000,
     "minConfidence": 0.7,
@@ -1031,7 +1035,7 @@ src/
   prompts.ts          # Config-driven system prompt builder
   context.ts          # Parent conversation context for inherit_context
   settings.ts         # Persistent settings (~/.pi/agent/subagents.json + .pi/subagents.json)
-  jev-selector.ts     # TypeSafe SystemOne Choice client and model/effort candidate filtering
+  jev-selector.ts     # TypeSafe/OpenRouter SystemOne Choice client and model/effort candidate filtering
   model-selection-guide.ts # Parent/Jev guide rendering and benchmark metadata
   env.ts              # Environment detection (git, platform)
 

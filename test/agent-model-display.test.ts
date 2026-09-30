@@ -154,6 +154,95 @@ describe("Agent tool result — effective model", () => {
     expect(result.details.tags).toContain("thinking: low");
   });
 
+  it("uses the Agent session's Pi OpenRouter authentication for Jev", async () => {
+    const agentDir = process.env.PI_CODING_AGENT_DIR!;
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(join(agentDir, "model-selection-guide.md"), "Choose from {{modelCandidates}}");
+    writeFileSync(join(agentDir, "model-selection-auto-guide.md"), "Omit model and thinking for automatic selection.");
+    writeFileSync(join(agentDir, "subagents.json"), JSON.stringify({
+      jev: {
+        enabled: true,
+        provider: "openrouter",
+        candidates: [
+          { model: "anthropic/claude-haiku-4-5", effort: "low" },
+          { model: "anthropic/claude-opus-4-6", effort: "high" },
+        ],
+      },
+    }));
+    const getApiKeyForProvider = vi.fn(async () => "agent-openrouter-secret");
+    const http = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      answers: {
+        selection: {
+          type: "choice",
+          choice: "candidate_1",
+          confidence: 0.9,
+          probabilities: { candidate_1: 0.9, candidate_2: 0.05, abstain: 0.05 },
+        },
+      },
+    }), { status: 200 }));
+    vi.mocked(runAgent).mockImplementation(async (_c: any, _t: any, _p: any, options: any) => {
+      const s = session("anthropic", "claude-haiku-4-5", "low");
+      options.onSessionCreated?.(s);
+      return { responseText: "done", session: s, aborted: false, steered: false } as never;
+    });
+    const tool = agentTool();
+    const context = ctx();
+    context.modelRegistry.getApiKeyForProvider = getApiKeyForProvider;
+
+    const result = await tool.execute(
+      "tc-jev-openrouter",
+      { prompt: "implement", description: "d", subagent_type: "general-purpose", run_in_background: false },
+      undefined,
+      vi.fn(),
+      context,
+    );
+
+    expect(getApiKeyForProvider).toHaveBeenCalledOnce();
+    expect(getApiKeyForProvider).toHaveBeenCalledWith("openrouter");
+    expect(http.mock.calls[0]?.[0]).toBe("https://openrouter.ai/api/v1/systemone");
+    expect(result.details.modelName).toBe("haiku 4.5");
+  });
+
+  it("requests parent selection without leaking a Pi OpenRouter authentication error", async () => {
+    const agentDir = process.env.PI_CODING_AGENT_DIR!;
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(join(agentDir, "model-selection-guide.md"), "Choose from {{modelCandidates}}");
+    writeFileSync(join(agentDir, "model-selection-auto-guide.md"), "Omit model and thinking for automatic selection.");
+    writeFileSync(join(agentDir, "subagents.json"), JSON.stringify({
+      jev: {
+        enabled: true,
+        provider: "openrouter",
+        candidates: [
+          { model: "anthropic/claude-haiku-4-5", effort: "low" },
+          { model: "anthropic/claude-opus-4-6", effort: "high" },
+        ],
+      },
+    }));
+    vi.mocked(runAgent).mockClear();
+    const context = ctx();
+    context.modelRegistry.getApiKeyForProvider = vi.fn(async () => {
+      throw new Error("raw-agent-auth-secret-sentinel");
+    });
+    const http = vi.spyOn(globalThis, "fetch");
+    const tool = agentTool();
+
+    const result = await tool.execute(
+      "tc-jev-openrouter-auth-failure",
+      { prompt: "implement", description: "d", subagent_type: "general-purpose", run_in_background: false },
+      undefined,
+      vi.fn(),
+      context,
+    );
+
+    expect(runAgent).not.toHaveBeenCalled();
+    expect(http).not.toHaveBeenCalled();
+    expect(result.details).toMatchObject({
+      status: "model_selection_required",
+      reason: expect.stringContaining("OpenRouter authentication"),
+    });
+    expect(JSON.stringify(result)).not.toContain("raw-agent-auth-secret-sentinel");
+  });
+
   it("does not spawn when the caller aborts after Jev selection resolves", async () => {
     const agentDir = process.env.PI_CODING_AGENT_DIR!;
     mkdirSync(agentDir, { recursive: true });

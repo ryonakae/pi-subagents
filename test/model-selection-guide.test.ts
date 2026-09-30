@@ -7,6 +7,7 @@ import type { JevSettings } from "../src/settings.js";
 
 const config = (enabled: boolean): JevSettings => ({
   enabled,
+  provider: "typesafe",
   model: "jev-1.13.0",
   timeoutMs: 5000,
   minConfidence: 0.7,
