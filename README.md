@@ -64,7 +64,7 @@ Or load directly for development:
 pi -e ./src/index.ts
 ```
 
-Requires pi **0.84.0 or newer**: the [`SubagentWorkflow`](#subagentworkflow) tool builds on `constrainedSampling` (pi 0.82.0) and pi-tui's `stripTerminalSequences` (0.84.0). The `peerDependencies` range declares it, so npm flags an older pi at install time.
+Requires pi **0.84.0 or newer**: the [`SubagentWorkflow`](#subagentworkflow) tool builds on `constrainedSampling` (pi 0.82.0) and pi-tui's `stripTerminalSequences` (0.84.0). Host-provided Pi and TypeBox packages use `"*"` in `peerDependencies` as required by Pi's extension loader, so npm does not enforce this minimum version.
 
 ### Other hosts
 
