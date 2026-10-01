@@ -149,19 +149,6 @@ The slot is claimed by the first activation only; subagent sessions re-activate 
 
 Prefer the bus. The registry has no reply envelope, no version, and no availability event — `globalThis[Symbol.for("pi-subagents:manager")] === undefined` is the only probe you get, and it is also `undefined` in a session that filtered pi-subagents out. Reach for it for the two things the bus has no verb for — *is anything still running*, and *give me a settled record back* — or for a headless host that wants to block on `waitForAll()` before exiting.
 
-## The child-context accessor
-
-Extensions that must avoid running inside a pi-subagents child can read `globalThis[Symbol.for("pi-subagents:child-context")]`. The slot contains a frozen, read-only accessor with this versioned contract:
-
-```ts
-{
-  version: 1;
-  isChildSession(): boolean;
-}
-```
-
-Call `isChildSession()` at the point where the distinction matters; do not cache its result. It reads the current async context, so parallel main-session and child-session work in the same process remain separate. Consumers should require `version === 1` and treat a missing or unsupported accessor as unknown rather than mutating or replacing it.
-
 ## Protocol versions
 
 `subagents:rpc:ping` replies `{ version: PROTOCOL_VERSION }`, currently `2` (`src/cross-extension-rpc.ts:33`). The constant was introduced already equal to `2` in 0.5.0; "v1" is a retroactive name for the pre-envelope contract, where spawn replied with a bare `{ id }` or `{ error }`, stop replied `{ success: boolean }` with no message, and each handler caught its own errors.

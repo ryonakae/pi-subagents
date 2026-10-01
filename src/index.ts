@@ -21,24 +21,21 @@ import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, loca
 import { AgentManager, isTopLevelAgent } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
-import { getChildContextAccessor } from "./child-context.js";
+import { inChildSessionContext } from "./child-context.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
-import { readEnabledModels, resolveEnabledModels } from "./enabled-models.js";
 import { GroupJoinManager } from "./group-join.js";
 import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
-import { selectJevCandidate } from "./jev-selector.js";
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
 import { runMentionClone } from "./mention-clone.js";
 import { describeModel, type ModelRegistry, resolveModel } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
-import { loadModelSelectionGuides } from "./model-selection-guide.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { DEFAULT_HOLD_MS, NudgeQueue } from "./nudge-queue.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
-import { applyAndEmitLoaded, DEFAULT_JEV_SETTINGS, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
+import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
@@ -306,7 +303,7 @@ export default function (pi: ExtensionAPI) {
   // Child AgentSessions load normal extensions. Re-entering this extension there
   // would create another manager and leak handlers. Nested orchestration is
   // injected as scoped custom tools by the existing manager instead.
-  if (getChildContextAccessor().isChildSession()) return;
+  if (inChildSessionContext()) return;
 
   // ---- Register custom notification renderer ----
   pi.registerMessageRenderer<NotificationDetails>(
@@ -1126,10 +1123,6 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_before_switch", () => {
-    for (const task of workflowTasks.values()) task.abortController.abort();
-    workflowTasks.clear();
-    for (const timer of pendingWorkflowNudges.values()) clearTimeout(timer);
-    pendingWorkflowNudges.clear();
     manager.clearCompleted(true);
     scheduler.stop();
   });
@@ -1445,7 +1438,7 @@ export default function (pi: ExtensionAPI) {
   // Apply persisted settings on startup and emit `subagents:settings_loaded`.
   // Global + project merged; missing → defaults; corrupt file emits a warning
   // to stderr and falls back to defaults.
-  const loadedSettings = applyAndEmitLoaded(
+  applyAndEmitLoaded(
     {
       setMaxConcurrent: (n) => manager.setMaxConcurrent(n),
       setMaxConcurrentForeground: (n) => manager.setMaxConcurrentForeground(n),
@@ -1474,11 +1467,6 @@ export default function (pi: ExtensionAPI) {
     },
     (event, payload) => pi.events.emit(event, payload),
   );
-  const configuredJev = loadedSettings.jev ?? { ...DEFAULT_JEV_SETTINGS, candidates: [] };
-  const modelSelectionGuides = loadModelSelectionGuides(configuredJev);
-  if (modelSelectionGuides.warning !== undefined) console.warn(`[pi-subagents] ${modelSelectionGuides.warning}`);
-  const jevConfig = configuredJev;
-  const selectionGuide = modelSelectionGuides.selectionEnabled ? modelSelectionGuides.selectionGuide : "";
 
   // ---- Agent tool ----
 
@@ -1518,15 +1506,6 @@ export default function (pi: ExtensionAPI) {
   const isolationCompactGuideline = isWorktreeIsolationEnabled()
     ? `\n- isolation: "worktree" gives the agent its own git worktree (removed on completion); changes land on a branch named in the result.`
     : "";
-  const modelOmissionDescription = jevConfig.enabled
-    ? "Agent definitions win. Normally omit to let Jev fill unspecified fields. If Jev cannot select, no child starts: model_selection_required asks you to choose missing model/thinking and call Agent again. Do not precompute fallback choices."
-    : "Omit to inherit the agent type's default, then the parent model.";
-  const thinkingOmissionDescription = jevConfig.enabled
-    ? "Omit to let Jev select unspecified effort with the model; if it cannot, choose explicitly only after model_selection_required."
-    : "Omit to inherit the agent type's default, then the parent's thinking level.";
-  const parentModelSelectionSection = modelSelectionGuides.parentGuide
-    ? `\n\n## Model selection\n\n${modelSelectionGuides.parentGuide}`
-    : "";
 
   // Compact Agent tool description (#91, `toolDescriptionMode: "compact"`) —
   // the same load-bearing facts as the full version at ~75% fewer tokens, for
@@ -1541,8 +1520,7 @@ Notes:
 - Parallel work: one message, multiple Agent calls — they run concurrently.
 - Subagents run in the background by default; you'll be notified when one completes. Pass run_in_background: false only when your very next action depends on the result and nothing else could usefully happen while it runs. Never fabricate or predict a pending agent's results — if the user asks before the notification arrives, say it's still running.
 - The result is not shown to the user — summarize it for them. Verify an agent's claimed code changes before reporting work done.
-- resume continues a previous agent by ID; steer_subagent messages a running one.
-- Model and thinking: ${modelOmissionDescription} Explicit values fill definition gaps.${isolationCompactGuideline}${parentModelSelectionSection}`;
+- resume continues a previous agent by ID; steer_subagent messages a running one.${isolationCompactGuideline}`;
 
   const fullAgentToolDescription = `Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it.
 
@@ -1570,8 +1548,9 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 - Use steer_subagent to send mid-run messages to a running background agent.
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent.
 - If an agent's description says it should be used proactively, try to use it without the user having to ask for it first.
-- Model and thinking: ${modelOmissionDescription} ${thinkingOmissionDescription} Agent definitions win; explicit values fill their gaps and automatic selection never overwrites fixed values.
-- Use inherit_context if the agent needs the parent conversation history.${isolationGuideline}${scheduleGuideline}${parentModelSelectionSection}
+- Use model to specify a different model (as "provider/modelId", or fuzzy e.g. "haiku", "sonnet").
+- Use thinking to control extended thinking level.
+- Use inherit_context if the agent needs the parent conversation history.${isolationGuideline}${scheduleGuideline}
 
 ## Writing the prompt
 
@@ -1597,8 +1576,6 @@ Terse command-style prompts produce shallow, generic work.
       agentDir: getAgentDir,
       isolationGuideline: () => isolationGuideline,
       scheduleGuideline: () => scheduleGuideline,
-      modelSelectionGuide: () => modelSelectionGuides.parentGuide,
-      modelCandidates: () => modelSelectionGuides.candidatesTable,
     };
     // Replacement callback (not a string) — agent descriptions may contain `$&` etc.
     return template.replace(/\{\{(\w+)\}\}/g, (raw, name: string) => {
@@ -1669,12 +1646,12 @@ Terse command-style prompts produce shallow, generic work.
       model: Type.Optional(
         Type.String({
           description:
-            `Optional model override. Accepts "provider/modelId" or fuzzy name (e.g. "haiku", "sonnet"). ${modelOmissionDescription}`,
+            'Optional model override. Accepts "provider/modelId" or fuzzy name (e.g. "haiku", "sonnet"). Omit to use the agent type\'s default.',
         }),
       ),
       thinking: Type.Optional(
         Type.String({
-          description: `Thinking level: ${THINKING_LEVELS.join(", ")}. Agent definitions win; explicit values fill their gaps before automatic selection. ${thinkingOmissionDescription}`,
+          description: `Thinking level: ${THINKING_LEVELS.join(", ")}. Overrides agent default.`,
         }),
       ),
       max_turns: Type.Optional(
@@ -1873,59 +1850,10 @@ Terse command-style prompts produce shallow, generic work.
       if (resolvedConfig.modelInput) {
         const resolved = resolveModel(resolvedConfig.modelInput, ctx.modelRegistry);
         if (typeof resolved === "string") {
-          if (!params.resume) return textResult(resolved);
+          if (resolvedConfig.modelFromParams) return textResult(resolved);
+          // config-specified: silent fallback to parent
         } else {
           model = resolved;
-        }
-      }
-
-      let thinking = resolvedConfig.thinking;
-      if (!params.resume && thinking !== undefined
-        && !(THINKING_LEVELS as readonly string[]).includes(thinking)) {
-        return textResult("Invalid thinking level in agent definition or request; no child started.");
-      }
-      // New Agent spawns only. Schedules persist their original request for a
-      // later fire, and resumes keep the session they already have.
-      if (!params.schedule && !params.resume) {
-        const enabledModelPatterns = readEnabledModels(ctx.cwd);
-        const enabledModels = enabledModelPatterns === undefined
-          ? undefined
-          : resolveEnabledModels(enabledModelPatterns, ctx.modelRegistry, ctx.cwd) ?? new Set<string>();
-        const selection = await selectJevCandidate({
-          task: params.prompt,
-          role: customConfig?.description ?? subagentType,
-          guide: selectionGuide,
-          config: jevConfig,
-          registry: ctx.modelRegistry,
-          fixedModel: resolvedConfig.modelInput !== undefined ? model : undefined,
-          fixedEffort: resolvedConfig.thinking,
-          enabledModels,
-          signal,
-          getOpenRouterApiKey: () => ctx.modelRegistry.getApiKeyForProvider("openrouter"),
-        });
-        if (signal?.aborted) throw signal.reason ?? new Error("Agent spawn aborted");
-        if (selection.kind === "fallback" && jevConfig.enabled) {
-          const details = {
-            status: "model_selection_required",
-            missing: [
-              ...(resolvedConfig.modelInput === undefined ? ["model"] : []),
-              ...(resolvedConfig.thinking === undefined ? ["thinking"] : []),
-            ],
-            fixed: {
-              ...(resolvedConfig.modelInput !== undefined ? { model: resolvedConfig.modelInput } : {}),
-              ...(resolvedConfig.thinking !== undefined ? { thinking: resolvedConfig.thinking } : {}),
-            },
-            reason: selection.warning ?? "Automatic selection unavailable.",
-            guide: join(getAgentDir(), "model-selection-guide.md"),
-          };
-          return {
-            content: [{ type: "text" as const, text: JSON.stringify(details) +
-              "\nNo child was started. Choose the missing fields yourself, then call Agent again with the same task and explicit model/thinking. Do not preselect fallback values on ordinary automatic requests." }],
-            details,
-          };
-        } else if (selection.kind === "selected") {
-          if (resolvedConfig.modelInput === undefined) model = selection.model;
-          if (resolvedConfig.thinking === undefined) thinking = selection.effort;
         }
       }
 
@@ -1943,6 +1871,7 @@ Terse command-style prompts produce shallow, generic work.
       if (scopeVerdict.kind === "error") return textResult(scopeVerdict.message);
       if (scopeVerdict.kind === "warn") ctx.ui.notify(scopeVerdict.message, "warning");
 
+      const thinking = resolvedConfig.thinking;
       const inheritContext = resolvedConfig.inheritContext;
       const runInBackground = resolvedConfig.runInBackground;
       const isolated = resolvedConfig.isolated;
@@ -2451,7 +2380,6 @@ Terse command-style prompts produce shallow, generic work.
    * detached — a rejection would surface as an unhandled one.
    */
   async function runWorkflowTask(ctx: ExtensionContext, task: WorkflowTask): Promise<void> {
-    task.parentSessionId = ctx.sessionManager.getSessionId();
     try {
       const result = await runWorkflow({
         script: task.script,
@@ -2464,34 +2392,11 @@ Terse command-style prompts produce shallow, generic work.
           signal: task.abortController.signal,
           rootSessionId: ctx.sessionManager.getSessionId(),
           workflowId: task.id,
-          jev: { config: jevConfig, guide: selectionGuide },
         }),
         onProgress: entries => updateWorkflowProgressBatch(task, entries),
         // The dialog's pause / skip / retry keys run through this; it is dropped
         // again when the task settles.
         onControl: control => { task.control = control; },
-        onModelSelectionRequired: request => {
-          if (workflowTasks.get(task.id) !== task || task.abortController.signal.aborted
-            || ctx.sessionManager.getSessionId() !== task.parentSessionId
-            || (currentCtx !== undefined && currentCtx.sessionManager.getSessionId() !== task.parentSessionId)) {
-            throw new Error("Parent session is no longer available.");
-          }
-          const details = {
-            status: "model_selection_required",
-            runId: task.id,
-            ...request,
-            prompt: request.prompt.slice(0, 2000),
-            guide: join(getAgentDir(), "model-selection-guide.md"),
-            scriptPath: task.scriptPath,
-          };
-          pi.sendMessage({
-            customType: "workflow-model-selection-required",
-            content: JSON.stringify(details) +
-              "\nNo child was started for this agent. Choose the missing fields yourself and call SubagentWorkflow({action:'route', runId, decisions:[{agentId, model?, effort?}]}). Keep fixed values. Do not rerun or resumeFromRunId: this live run continues after routing. The task preview may be truncated; consult the script for full context.",
-            display: true,
-            details,
-          }, { deliverAs: "followUp", triggerTurn: true });
-        },
         journal: {
           ...(task.replay !== undefined ? { entries: task.replay } : {}),
           ...(task.journalPath !== undefined
@@ -2515,8 +2420,6 @@ Terse command-style prompts produce shallow, generic work.
     fleet.update();
     const result = workflowResultText(task);
     scheduleWorkflowNudge(task.id, () => {
-      if (workflowTasks.get(task.id) !== task
-        || (currentCtx !== undefined && currentCtx.sessionManager.getSessionId() !== task.parentSessionId)) return;
       pi.sendMessage<NotificationDetails>({
         customType: "subagent-notification",
         content: formatWorkflowNotification(task),
@@ -2551,13 +2454,6 @@ Terse command-style prompts produce shallow, generic work.
       "A workflow runs in the background and notifies you when it finishes — do not poll or sleep waiting for it.",
     ],
     parameters: Type.Object({
-      action: Type.Optional(Type.Literal("route", { description: "Resolve pending model selection in a live run; omit to start a script." })),
-      runId: Type.Optional(Type.String({ description: "Live workflow run from a model_selection_required notification." })),
-      decisions: Type.Optional(Type.Array(Type.Object({
-        agentId: Type.String(),
-        model: Type.Optional(Type.String()),
-        effort: Type.Optional(Type.String()),
-      }), { minItems: 1, description: "Parent decisions for waiting agents. The entire batch must be valid before any is accepted." })),
       script: Type.Optional(
         Type.String({
           maxLength: 524288,
@@ -2634,26 +2530,6 @@ Terse command-style prompts produce shallow, generic work.
     },
 
     execute: async (toolCallId, params, _signal, _onUpdate, ctx) => {
-      _signal?.throwIfAborted();
-      if (params.action === "route") {
-        if (params.script !== undefined || params.scriptPath !== undefined || params.name !== undefined
-          || params.resumeFromRunId !== undefined || params.args !== undefined) {
-          throw new Error("Model routing cannot be combined with script execution or journal replay.");
-        }
-        const task = params.runId === undefined ? undefined : workflowTasks.get(params.runId);
-        if (!task || task.parentSessionId !== ctx.sessionManager.getSessionId()
-          || (currentCtx !== undefined && currentCtx.sessionManager.getSessionId() !== task.parentSessionId)
-          || task.abortController.signal.aborted || (task.status !== "running" && task.status !== "paused")
-          || !task.control?.route) {
-          throw new Error("No live workflow in this parent session for model routing.");
-        }
-        const agentIds = task.control.route(params.decisions ?? []);
-        const details = { status: "routed", runId: task.id, agentIds };
-        return { content: [{ type: "text" as const, text: JSON.stringify(details) }], details };
-      }
-      if (params.runId !== undefined || params.decisions !== undefined) {
-        throw new Error("Use action: 'route' for model selection decisions.");
-      }
       const resumeFrom = resolveResumeTarget(params.resumeFromRunId, workflowTasks);
       if (resumeFrom !== undefined && !resumeFrom.ok) return textResult(resumeFrom.message);
 
@@ -2875,8 +2751,6 @@ Terse command-style prompts produce shallow, generic work.
     // Detached: session_start is awaited by the host, and a workflow can run for
     // minutes — blocking here would hold the whole session's startup.
     void runWorkflowTask(ctx, task).then(() => {
-      if (workflowTasks.get(task.id) !== task
-        || (currentCtx !== undefined && currentCtx.sessionManager.getSessionId() !== task.parentSessionId)) return;
       // No tool call to attach a result card to, so the card becomes a session
       // entry (same layout), and the outcome is handed to the model as context
       // for its next turn rather than forcing one.
@@ -3647,7 +3521,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
   // fails to satisfy `never` — turning a silent settings-erasure bug into a
   // typecheck error. `npm run typecheck` runs in CI.
   type _NoMissingSettingsKeys =
-    Exclude<keyof SubagentsSettings, keyof ReturnType<typeof snapshotSettings> | "jev"> extends never
+    Exclude<keyof SubagentsSettings, keyof ReturnType<typeof snapshotSettings>> extends never
       ? true
       : ["snapshotSettings() is missing a SubagentsSettings key"];
   const _settingsSnapshotIsComplete: _NoMissingSettingsKeys = true;

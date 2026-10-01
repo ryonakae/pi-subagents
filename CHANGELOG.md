@@ -7,15 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-- **Optional Jev model and reasoning selection for new Agent and Workflow spawns.** A global-only, default-off `jev` setting filters configured `provider/modelId` + effort candidates through pi's model registry, scoped models and fixed call/frontmatter values. One eligible candidate is selected locally; two or more use TypeSafe or OpenRouter SystemOne Choice with abstention and confidence handling. TypeSafe remains the default and uses `TYPESAFE_API_KEY`; OpenRouter uses its fixed SystemOne endpoint and the current Pi session's standard authentication, including saved credentials and `OPENROUTER_API_KEY`. Missing credentials, unavailable candidates/guides, request limits, abstention, low confidence, timeout, HTTP or typed-response failures request a decision from the actual parent without spawning. Ordinary Agent returns `model_selection_required`; Workflow sends a parent follow-up and accepts `SubagentWorkflow({action: "route", runId, decisions})` in the same run. Waiting agents release slots without rerunning completed jobs or gates; batches validate atomically and respect pause, skip, abort, and parent-session boundaries. Existing resume, nested, scheduled and RPC paths are unchanged.
-- **Versioned child-session context for other extensions.** `globalThis[Symbol.for("pi-subagents:child-context")]` exposes a frozen `{ version: 1, isChildSession() }` accessor backed by the existing async child context, so parallel main and child work remain distinguishable without exposing mutable extension state.
-
-### Changed
-- **Custom Agent descriptions can embed model-selection guidance.** `{{modelSelectionGuide}}` selects the manual or Jev-auto guide and `{{modelCandidates}}` renders the configured candidate table. Agent and Workflow tool prose now distinguishes omission (automatic selection, then actual-parent decision when Jev is on) from explicit fixed model/thinking values; Workflow documents `effort` as its spelling of `thinking`.
-
 ### Fixed
-- **Workflow model/effort selection now honors agent definitions before call options**, including when Jev is off. Unresolvable fixed models and invalid thinking levels stop new launches rather than silently replacing them.
 - **The workflow stand-down now recognises a lowercase `workflow` tool** ([#283](https://github.com/tintinweb/pi-subagents/issues/283) — thanks [@zampierilucas](https://github.com/zampierilucas)). The match is exact on purpose, and the set held `Workflow` and `SubagentWorkflow` only, so `@quintinshaw/pi-dynamic-workflows` — which registers lowercase `workflow` — never tripped it: with `workflowsEnabled` unset, both orchestrators reached the model and nothing warned. Adding the third name is the whole fix; exactness is kept, so a `list_workflows` still cannot take the feature down.
 
 ## [0.19.0] - 2026-08-25

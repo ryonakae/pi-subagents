@@ -56,16 +56,12 @@ function makePi() {
 }
 
 function ctx() {
-  const haiku = { provider: "anthropic", id: "claude-haiku-4-5", name: "Haiku" };
   return {
     hasUI: false,
     ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() },
     cwd: process.cwd(),
     model: undefined,
-    modelRegistry: {
-      find: vi.fn((provider: string, id: string) => provider === haiku.provider && id === haiku.id ? haiku : undefined),
-      getAvailable: vi.fn(() => [haiku]),
-    },
+    modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
     sessionManager: { getSessionId: vi.fn(() => "s1"), getBranch: vi.fn(() => []) },
     getSystemPrompt: vi.fn(() => "parent"),
   } as any;

@@ -49,10 +49,6 @@ function card(over: Partial<WorkflowCardInput> & { progress: readonly WorkflowEn
 const treeRows = (lines: string[]) => lines.filter(l => /[╭╰├└,`|]/.test(l)).map(l => l.slice(2));
 
 describe("inline glyph mapping", () => {
-  it("names parent model selection instead of implying a child is running", () => {
-    expect(card({ progress: [agentEntry({ index: 0, selectionPending: true })] }).join("\n"))
-      .toContain("awaiting parent model selection");
-  });
   const progress: WorkflowEntry[] = [
     agentEntry({ index: 0, label: "done", state: "done" }),
     agentEntry({ index: 1, label: "failed", state: "error" }),

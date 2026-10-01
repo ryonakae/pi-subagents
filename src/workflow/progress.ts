@@ -100,7 +100,6 @@ export interface WorkflowAgentEntry {
   skipped?: boolean;
   blocked?: boolean;
   cached?: boolean;
-  selectionPending?: boolean;
   queuedAt?: number;
   startedAt?: number;
   lastProgressAt?: number;
@@ -181,7 +180,6 @@ export function displayState(entry: WorkflowAgentEntry, workflowActive: boolean)
     return "failed";
   }
   if (!workflowActive) return "interrupted";
-  if (entry.selectionPending) return "queued";
   // Queued means accepted but never given a slot. An entry with no queuedAt at
   // all predates the semaphore and is treated as running.
   return entry.queuedAt != null && entry.startedAt == null ? "queued" : "running";

@@ -406,7 +406,6 @@ export function subStatusAnnotations(
   now: number,
 ): string[] {
   const parts: string[] = [];
-  if (entry.selectionPending && state === "queued") parts.push("awaiting parent model selection");
   if (entry.isolation) parts.push(entry.isolation);
   if (entry.cached) parts.push(REPLAYED_ANNOTATION);
   if (entry.lastAttemptReason) {
@@ -567,7 +566,7 @@ function outcomeBody(entry: WorkflowAgentEntry, state: WorkflowDisplayState): st
     case "interrupted":
       return WORKFLOW_DIALOG_COPY.stoppedEarly;
     case "queued":
-      return entry.selectionPending ? "awaiting parent model selection" : WORKFLOW_DIALOG_COPY.waitingForSlot;
+      return WORKFLOW_DIALOG_COPY.waitingForSlot;
     case "running":
       return WORKFLOW_DIALOG_COPY.notAvailableYet;
     case "failed":

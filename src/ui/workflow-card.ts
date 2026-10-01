@@ -245,9 +245,6 @@ export const REPLAYED_ANNOTATION = "from resume journal";
  */
 export function agentStatSegments(entry: WorkflowAgentEntry): string[] {
   const parts: string[] = [];
-  if (entry.selectionPending && (entry.state === "start" || entry.state === "progress")) {
-    parts.push("awaiting parent model selection");
-  }
   if (entry.agentType) parts.push(entry.agentType);
   const model = formatModel(entry);
   if (model) parts.push(model);

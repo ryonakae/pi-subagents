@@ -13,9 +13,6 @@
  * feeds it: the host reading the record's snapshot and handing it over.
  */
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/agent-runner.js", () => ({
@@ -90,266 +87,6 @@ describe("the workflow host reports a child's effective configuration", () => {
     manager = new AgentManager();
   });
 
-  it("applies a deterministic Jev candidate when a fresh workflow agent omits model and effort", async () => {
-    const cwd = mkdtempSync(join(tmpdir(), "workflow-jev-"));
-    mkdirSync(join(cwd, ".pi"), { recursive: true });
-    writeFileSync(join(cwd, ".pi", "settings.json"), JSON.stringify({
-      enabledModels: ["anthropic/claude-haiku-4-5"],
-    }));
-    const haiku = {
-      provider: "anthropic",
-      id: "claude-haiku-4-5",
-      name: "Haiku 4.5",
-      reasoning: true,
-    };
-    childSessionReports({ model: haiku, thinkingLevel: "low" });
-    const host = createWorkflowHost({
-      pi,
-      ctx: ctx({
-        cwd,
-        modelRegistry: {
-          find: vi.fn(() => haiku),
-          getAvailable: vi.fn(() => [haiku]),
-        },
-      }),
-      manager,
-      jev: {
-        config: {
-          enabled: true,
-          provider: "typesafe",
-          model: "jev-1.13.0",
-          timeoutMs: 5000,
-          minConfidence: 0.7,
-          maxRequestBytes: 65_536,
-          candidates: [{ model: "anthropic/claude-haiku-4-5", effort: "low" }],
-        },
-        guide: "Choose conservatively.",
-      },
-    });
-
-    try {
-      await host.spawnAgent(spawnRequest());
-      expect(vi.mocked(runAgent).mock.calls[0]?.[3]).toMatchObject({
-        model: haiku,
-        thinkingLevel: "low",
-      });
-    } finally {
-      rmSync(cwd, { recursive: true, force: true });
-    }
-  });
-
-  it("uses the Workflow session's Pi OpenRouter authentication for Jev", async () => {
-    const getApiKeyForProvider = vi.fn(async () => "workflow-openrouter-secret");
-    const haiku = {
-      provider: "anthropic",
-      id: "claude-haiku-4-5",
-      name: "Haiku 4.5",
-      reasoning: true,
-    };
-    const opus = {
-      provider: "anthropic",
-      id: "claude-opus-4-6",
-      name: "Opus 4.6",
-      reasoning: true,
-    };
-    const http = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
-      answers: {
-        selection: {
-          type: "choice",
-          choice: "candidate_1",
-          confidence: 0.9,
-          probabilities: { candidate_1: 0.9, candidate_2: 0.05, abstain: 0.05 },
-        },
-      },
-    }), { status: 200 }));
-    childSessionReports({ model: haiku, thinkingLevel: "low" });
-    const host = createWorkflowHost({
-      pi,
-      ctx: ctx({
-        modelRegistry: {
-          find: vi.fn((_provider: string, id: string) => [haiku, opus].find(model => model.id === id)),
-          getAvailable: vi.fn(() => [haiku, opus]),
-          getApiKeyForProvider,
-        },
-      }),
-      manager,
-      jev: {
-        config: {
-          enabled: true,
-          provider: "openrouter",
-          model: "typesafe/jev-1.13",
-          timeoutMs: 5000,
-          minConfidence: 0.7,
-          maxRequestBytes: 65_536,
-          candidates: [
-            { model: "anthropic/claude-haiku-4-5", effort: "low" },
-            { model: "anthropic/claude-opus-4-6", effort: "high" },
-          ],
-        },
-        guide: "Choose conservatively.",
-      },
-    });
-
-    await host.spawnAgent(spawnRequest());
-
-    expect(getApiKeyForProvider).toHaveBeenCalledOnce();
-    expect(getApiKeyForProvider).toHaveBeenCalledWith("openrouter");
-    expect(http.mock.calls[0]?.[0]).toBe("https://openrouter.ai/api/v1/systemone");
-    expect(vi.mocked(runAgent).mock.calls[0]?.[3]).toMatchObject({ model: haiku, thinkingLevel: "low" });
-    http.mockRestore();
-  });
-
-  it("falls back to Workflow parent selection without leaking a Pi OpenRouter authentication error", async () => {
-    const haiku = {
-      provider: "anthropic",
-      id: "claude-haiku-4-5",
-      name: "Haiku 4.5",
-      reasoning: true,
-    };
-    const opus = {
-      provider: "anthropic",
-      id: "claude-opus-4-6",
-      name: "Opus 4.6",
-      reasoning: true,
-    };
-    const getApiKeyForProvider = vi.fn(async () => {
-      throw new Error("raw-workflow-auth-secret-sentinel");
-    });
-    vi.mocked(runAgent).mockClear();
-    const http = vi.spyOn(globalThis, "fetch");
-    const host = createWorkflowHost({
-      pi,
-      ctx: ctx({
-        modelRegistry: {
-          find: vi.fn((_provider: string, id: string) => [haiku, opus].find(model => model.id === id)),
-          getAvailable: vi.fn(() => [haiku, opus]),
-          getApiKeyForProvider,
-        },
-      }),
-      manager,
-      jev: {
-        config: {
-          enabled: true,
-          provider: "openrouter",
-          model: "typesafe/jev-1.13",
-          timeoutMs: 5000,
-          minConfidence: 0.7,
-          maxRequestBytes: 65_536,
-          candidates: [
-            { model: "anthropic/claude-haiku-4-5", effort: "low" },
-            { model: "anthropic/claude-opus-4-6", effort: "high" },
-          ],
-        },
-        guide: "Choose conservatively.",
-      },
-    });
-
-    const result = await host.spawnAgent(spawnRequest());
-
-    expect(getApiKeyForProvider).toHaveBeenCalledWith("openrouter");
-    expect(runAgent).not.toHaveBeenCalled();
-    expect(http).not.toHaveBeenCalled();
-    expect(result).toMatchObject({ ok: false, error: expect.stringContaining("Parent model selection") });
-    expect(JSON.stringify(result)).not.toContain("raw-workflow-auth-secret-sentinel");
-    http.mockRestore();
-  });
-
-  it("does not spawn when the workflow is aborted after Jev selection resolves", async () => {
-    const controller = new AbortController();
-    const haiku = {
-      provider: "anthropic",
-      id: "claude-haiku-4-5",
-      name: "Haiku 4.5",
-      reasoning: true,
-    };
-    childSessionReports({ model: haiku, thinkingLevel: "low" });
-    const host = createWorkflowHost({
-      pi,
-      ctx: ctx({
-        modelRegistry: {
-          find: vi.fn(() => haiku),
-          getAvailable: vi.fn(() => [haiku]),
-        },
-      }),
-      manager,
-      signal: controller.signal,
-      jev: {
-        config: {
-          enabled: true,
-          provider: "typesafe",
-          model: "jev-1.13.0",
-          timeoutMs: 5000,
-          minConfidence: 0.7,
-          maxRequestBytes: 65_536,
-          candidates: [{ model: "anthropic/claude-haiku-4-5", effort: "low" }],
-        },
-        guide: "Choose conservatively.",
-      },
-    });
-    const spawnAndWait = vi.spyOn(manager, "spawnAndWait");
-
-    const spawning = host.spawnAgent(spawnRequest());
-    controller.abort(new Error("workflow cancelled after selection"));
-
-    await expect(spawning).rejects.toThrow("workflow cancelled after selection");
-    expect(spawnAndWait).not.toHaveBeenCalled();
-    expect(runAgent).not.toHaveBeenCalled();
-  });
-
-  it("does not spawn without a parent-selection channel when no candidate survives", async () => {
-    const cwd = mkdtempSync(join(tmpdir(), "workflow-jev-empty-scope-"));
-    mkdirSync(join(cwd, ".pi"), { recursive: true });
-    writeFileSync(join(cwd, ".pi", "settings.json"), JSON.stringify({
-      enabledModels: ["unregistered/model"],
-    }));
-    const parent = {
-      provider: "anthropic",
-      id: "claude-opus-4-6",
-      name: "Opus 4.6",
-      reasoning: true,
-    };
-    const haiku = {
-      provider: "anthropic",
-      id: "claude-haiku-4-5",
-      name: "Haiku 4.5",
-      reasoning: true,
-    };
-    childSessionReports({ model: parent, thinkingLevel: "high" });
-    const context = ctx({
-      cwd,
-      model: parent,
-      modelRegistry: {
-        find: vi.fn((_provider: string, id: string) => [parent, haiku].find(model => model.id === id)),
-        getAvailable: vi.fn(() => [parent, haiku]),
-      },
-    });
-    const host = createWorkflowHost({
-      pi,
-      ctx: context,
-      manager,
-      jev: {
-        config: {
-          enabled: true,
-          provider: "typesafe",
-          model: "jev-1.13.0",
-          timeoutMs: 5000,
-          minConfidence: 0.7,
-          maxRequestBytes: 65_536,
-          candidates: [{ model: "anthropic/claude-haiku-4-5", effort: "low" }],
-        },
-        guide: "Choose conservatively.",
-      },
-    });
-
-    try {
-      const result = await host.spawnAgent(spawnRequest());
-      expect(runAgent).not.toHaveBeenCalled();
-      expect(result).toMatchObject({ ok: false, error: expect.stringContaining("Parent model selection") });
-    } finally {
-      rmSync(cwd, { recursive: true, force: true });
-    }
-  });
-
   it("hands over the model the session actually resolved to, not the script's spelling", async () => {
     // `name` too: resolveModel fuzzy-matches across id, name and provider/id.
     const haiku = { provider: "anthropic", id: "claude-haiku-4-5", name: "Haiku 4.5" };
@@ -397,11 +134,16 @@ describe("the workflow host reports a child's effective configuration", () => {
     expect(reported[0]?.requestedThinking).toBe("max");
   });
 
-  it("preserves the agent file's model over the script and discloses the override", async () => {
+  // Why the workflow path never discloses a model override at all: unlike the
+  // Agent tool (`agentConfig?.model ?? params.model`), this path resolves
+  // `request.model ?? config?.model`, so the script outranks the agent file and
+  // therefore always got the model it asked for. Seeding a `requestedModel` here
+  // would describe a precedence that does not exist.
+  it("lets the script's model outrank the agent file's, so there is nothing to disclose", async () => {
     const haiku = { provider: "anthropic", id: "claude-haiku-4-5", name: "Haiku 4.5" };
     const opus = { provider: "anthropic", id: "claude-opus-4-6", name: "Opus 4.6" };
     registerAgents(new Map([["pinned", { name: "pinned", model: "anthropic/claude-opus-4-6" } as any]]));
-    childSessionReports({ model: opus });
+    childSessionReports({ model: haiku });
     const host = createWorkflowHost({
       pi,
       ctx: ctx({
@@ -422,26 +164,10 @@ describe("the workflow host reports a child's effective configuration", () => {
       spawnRequest({ agentType: "pinned", model: "haiku", onResolved: configCollector(reported) }),
     );
 
-    expect(vi.mocked(runAgent).mock.calls[0]?.[3]).toMatchObject({ model: opus });
-    expect(reported[0]?.requestedModel).toBe("haiku");
-  });
-
-  it("keeps definition effort over the call when automatic selection is off", async () => {
-    registerAgents(new Map([["pinned", { name: "pinned", thinking: "low" }]]));
-    childSessionReports({ model: { provider: "test", id: "model" }, thinkingLevel: "low" });
-    const reported: Record<string, unknown>[] = [];
-    const host = createWorkflowHost({ pi, ctx: ctx({}), manager });
-    await host.spawnAgent(spawnRequest({ agentType: "pinned", effort: "high", onResolved: configCollector(reported) }));
-    expect(vi.mocked(runAgent).mock.calls[0]?.[3].thinkingLevel).toBe("low");
-    expect(reported[0]).toMatchObject({ thinking: "low", requestedThinking: "high" });
-  });
-
-  it("refuses an unavailable fixed model instead of inheriting the parent", async () => {
-    registerAgents(new Map([["pinned", { name: "pinned", model: "unknown/no-model" }]]));
-    const host = createWorkflowHost({ pi, ctx: ctx({}), manager });
-    const result = await host.spawnAgent(spawnRequest({ agentType: "pinned" }));
-    expect(result).toMatchObject({ ok: false, error: expect.stringContaining("Model not found") });
-    expect(runAgent).not.toHaveBeenCalled();
+    // The script's "haiku" won over the file's pinned opus...
+    expect(vi.mocked(runAgent).mock.calls[0]?.[3]).toMatchObject({ model: haiku });
+    // ...so nothing was overridden, and nothing is disclosed.
+    expect(reported[0]?.requestedModel).toBeUndefined();
   });
 
   it("says nothing about a level that was honoured", async () => {

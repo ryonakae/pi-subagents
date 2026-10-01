@@ -28,18 +28,7 @@ vi.mock("../src/mention-clone.js", () => ({ runMentionClone: vi.fn() }));
 import { getDefaultMaxTurns, resumeAgent, runAgent, setDefaultMaxTurns } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
 import { runMentionClone } from "../src/mention-clone.js";
-import { ctx as baseCtx, flush, type Hermetic, hermeticDir, makePi, textOf } from "./helpers/boot-extension.js";
-
-function ctx(overrides: Record<string, unknown> = {}) {
-  const haiku = { provider: "anthropic", id: "claude-haiku-4-5", name: "Haiku" };
-  return baseCtx({
-    modelRegistry: {
-      find: vi.fn((provider: string, id: string) => provider === haiku.provider && id === haiku.id ? haiku : undefined),
-      getAvailable: vi.fn(() => [haiku]),
-    },
-    ...overrides,
-  });
-}
+import { ctx, flush, type Hermetic, hermeticDir, makePi, textOf } from "./helpers/boot-extension.js";
 
 let hermetic: Hermetic | undefined;
 /** The most recently booted extension, so teardown runs even when a test throws. */
