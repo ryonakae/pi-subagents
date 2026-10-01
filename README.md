@@ -1,12 +1,12 @@
 # pi-subagents (ryonakae fork)
 
-> **Fork note:** This is an independently maintained fork of [tintinweb/pi-subagents](https://github.com/tintinweb/pi-subagents). The default `master` branch includes:
+> **Fork note:** This is an independently maintained fork of [tintinweb/pi-subagents](https://github.com/tintinweb/pi-subagents). The experimental `feat/jev-routing` branch includes:
 > - Jev model/effort selection through TypeSafe or OpenRouter that returns the decision to the actual parent when Jev declines or cannot select, rather than silently inheriting.
 > - Pi-standard OpenRouter authentication for both `Agent` and `SubagentWorkflow` routing.
 > - Definition-priority model/effort resolution for both `Agent` and `SubagentWorkflow` calls.
 > - Read-only child-session identification for inline-skills integrations.
 >
-> Jev is off by default (`jev.enabled: false`) and keeps TypeSafe as its default provider. Install this fork with `pi install git:github.com/ryonakae/pi-subagents@master`.
+> Jev is off by default (`jev.enabled: false`) and keeps TypeSafe as its default provider. Install this branch with `pi install git:github.com/ryonakae/pi-subagents@feat/jev-routing`. The default `master` branch does not include Jev integration.
 
 A focused fork of [tintinweb/pi-subagents](https://github.com/tintinweb/pi-subagents). It retains upstream's tools and workflow support while fixing completion notifications that arrive after their results have already been consumed in TUI and RPC sessions. The notification fix follows [vincelwt's PR #265](https://github.com/tintinweb/pi-subagents/pull/265).
 
@@ -49,14 +49,14 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 
 ## Install
 
-Install the default branch of this fork:
+Install the experimental Jev branch of this fork:
 
 ```sh
 pi remove npm:@tintinweb/pi-subagents
-pi install git:github.com/ryonakae/pi-subagents@master
+pi install git:github.com/ryonakae/pi-subagents@feat/jev-routing
 ```
 
-Do not load the upstream npm package and this fork together. The package name remains unchanged, but this fork is distributed through Git, not npm. Update with `pi update git:github.com/ryonakae/pi-subagents@master`. To pin a reviewed version instead, replace `master` with its full commit SHA; a pinned commit does not follow branch updates. Start a fresh Pi session after switching.
+Do not load the upstream npm package and this fork together. The package name remains unchanged, but this fork is distributed through Git, not npm. Update with `pi update git:github.com/ryonakae/pi-subagents@feat/jev-routing`. To pin a reviewed version instead, replace `feat/jev-routing` with its full commit SHA; a pinned commit does not follow branch updates. Start a fresh Pi session after switching.
 
 Or load directly for development:
 
