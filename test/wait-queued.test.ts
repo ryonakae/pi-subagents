@@ -44,6 +44,7 @@ function makePi() {
 function ctx() {
   return {
     hasUI: false,
+    isIdle: () => true,
     ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() },
     cwd: process.cwd(),
     model: undefined,
@@ -132,6 +133,7 @@ describe("get_subagent_result wait:true on a queued agent", () => {
   it("aborts a running result wait without aborting or consuming the child", async () => {
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
+    await lifecycle.get("session_start")({}, ctx());
 
     let resolveRun: (() => void) | undefined;
     let childSignal: AbortSignal | undefined;

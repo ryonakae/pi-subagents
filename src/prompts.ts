@@ -66,6 +66,16 @@ Working directory: ${cwd}
 ${env.isGitRepo ? `Git repository: yes\nBranch: ${env.branch}` : "Not a git repository"}
 Platform: ${env.platform}`;
 
+  // Replace-mode agents do not inherit the parent's delegation instructions.
+  const completionBlock = `\n\n<task_completion>
+Work until the assigned completion criteria are met, or a concrete blocker prevents safe continuation.
+Do not use a final answer for a progress update or an offer to continue while assigned work remains feasible.
+If blocked, report the blocker, completed work, and remaining scope without claiming completion.
+Respect explicit stop requests and runtime limits.
+Steering messages supplement the assignment unless they explicitly replace or cancel it.
+After addressing an additional question, continue the remaining original work.
+</task_completion>`;
+
   // A worktree agent is told its cwd twice: by the env block above (the copy)
   // and by whatever names the main checkout — the inherited parent prompt in
   // append mode, or the task prompt in either mode. It follows the latter and
@@ -123,7 +133,7 @@ You are operating as a sub-agent invoked to handle a specific task.
     // placed verbatim (no wrapper tag) so it forms an identical byte prefix
     // with the parent session, maximising KV cache hits. The <active_agent>
     // tag and env block vary per call and are placed after the cached prefix.
-    return identity + "\n\n" + bridge + "\n\n" + activeAgentTag + envBlock + worktreeBlock + workflowBlock + customSection + extrasSuffix;
+    return identity + "\n\n" + bridge + "\n\n" + activeAgentTag + envBlock + completionBlock + worktreeBlock + workflowBlock + customSection + extrasSuffix;
   }
 
   // "replace" mode — env header + the config's full system prompt
@@ -132,7 +142,7 @@ You have been invoked to handle a specific task autonomously.
 
 ${envBlock}`;
 
-  return activeAgentTag + replaceHeader + worktreeBlock + workflowBlock + "\n\n" + config.systemPrompt + extrasSuffix;
+  return activeAgentTag + replaceHeader + completionBlock + worktreeBlock + workflowBlock + "\n\n" + config.systemPrompt + extrasSuffix;
 }
 
 /** Fallback base prompt when parent system prompt is unavailable in append mode. */

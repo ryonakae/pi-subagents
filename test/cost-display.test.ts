@@ -40,11 +40,14 @@ const spawn = (tools: Map<string, any>) =>
 
 describe("cost display", () => {
   let hermetic: Hermetic;
+  let booted: ReturnType<typeof makePi>["lifecycle"] | undefined;
 
-  function boot(settings: Record<string, unknown>) {
+  async function boot(settings: Record<string, unknown>) {
     hermetic = hermeticDir({ settings });
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
+    booted = lifecycle;
+    await lifecycle.get("session_start")({}, ctx());
     return { pi, tools, lifecycle };
   }
 
@@ -52,7 +55,9 @@ describe("cost display", () => {
     vi.mocked(runAgent).mockReset();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    await booted?.get("session_shutdown")?.();
+    booted = undefined;
     delete (globalThis as any)[Symbol.for("pi-subagents:manager")];
     registerAgents(new Map());
     hermetic?.restore();
@@ -60,7 +65,7 @@ describe("cost display", () => {
 
   describe("the foreground result the orchestrator reads", () => {
     it("names the cost in the stats it already reports", async () => {
-      const { tools } = boot({ showCost: true });
+      const { tools } = await boot({ showCost: true });
       runSpending(COST);
 
       const text = textOf(await spawn(tools));
@@ -72,14 +77,14 @@ describe("cost display", () => {
     });
 
     it("says nothing when the setting is off", async () => {
-      const { tools } = boot({ showCost: false });
+      const { tools } = await boot({ showCost: false });
       runSpending(COST);
 
       expect(textOf(await spawn(tools))).not.toContain("$");
     });
 
     it("says nothing for a model with no pricing data", async () => {
-      const { tools } = boot({ showCost: true });
+      const { tools } = await boot({ showCost: true });
       runSpending(0);
 
       const text = textOf(await spawn(tools));
@@ -90,7 +95,7 @@ describe("cost display", () => {
 
   describe("get_subagent_result", () => {
     it("reports the cost as its own labelled field", async () => {
-      const { tools } = boot({ showCost: true });
+      const { tools } = await boot({ showCost: true });
       runSpending(COST);
       await spawn(tools);
       await flush();
@@ -106,7 +111,7 @@ describe("cost display", () => {
     });
 
     it("omits the field entirely when unpriced", async () => {
-      const { tools } = boot({ showCost: true });
+      const { tools } = await boot({ showCost: true });
       runSpending(0);
       await spawn(tools);
       await flush();
@@ -140,7 +145,7 @@ describe("cost display", () => {
       );
 
     it("includes the cost in the usage block when enabled", async () => {
-      const { pi, tools } = boot({ showCost: true, defaultJoinMode: "async" });
+      const { pi, tools } = await boot({ showCost: true, defaultJoinMode: "async" });
       runSpending(COST);
 
       await spawnBackground(tools);
@@ -152,7 +157,7 @@ describe("cost display", () => {
       // A figure the orchestrator was not asked to track is one it may start
       // reporting unprompted, so the setting gates the context too, not just
       // what a human sees.
-      const { pi, tools } = boot({ showCost: false, defaultJoinMode: "async" });
+      const { pi, tools } = await boot({ showCost: false, defaultJoinMode: "async" });
       runSpending(COST);
 
       await spawnBackground(tools);
@@ -163,7 +168,7 @@ describe("cost display", () => {
     });
 
     it("omits it for a model with no pricing data", async () => {
-      const { pi, tools } = boot({ showCost: true, defaultJoinMode: "async" });
+      const { pi, tools } = await boot({ showCost: true, defaultJoinMode: "async" });
       runSpending(0);
 
       await spawnBackground(tools);
@@ -185,30 +190,30 @@ describe("cost display", () => {
       totalTokens, totalCost, durationMs: 1000, resultPreview: "done",
     });
 
-    it("totals a group, so nobody adds four figures by hand", () => {
-      const { pi } = boot({ showCost: true });
+    it("totals a group, so nobody adds four figures by hand", async () => {
+      const { pi } = await boot({ showCost: true });
       const out = render(pi, { ...agent("first", 1000, 0.01), others: [agent("second", 3000, 0.02)] });
 
       expect(out).toContain("2 agents · 4.0k token · ~$0.03");
     });
 
-    it("does not total a single agent — the line above already says it", () => {
-      const { pi } = boot({ showCost: true });
+    it("does not total a single agent — the line above already says it", async () => {
+      const { pi } = await boot({ showCost: true });
       const out = render(pi, agent("only", 1000, 0.01));
 
       expect(out).toContain("~$0.01");
       expect(out).not.toContain("1 agents");
     });
 
-    it("shows no total, and no per-agent cost, when unpriced", () => {
-      const { pi } = boot({ showCost: true });
+    it("shows no total, and no per-agent cost, when unpriced", async () => {
+      const { pi } = await boot({ showCost: true });
       const out = render(pi, { ...agent("first", 1000, 0), others: [agent("second", 3000, 0)] });
 
       expect(out).not.toContain("$");
     });
 
-    it("shows nothing when the setting is off", () => {
-      const { pi } = boot({ showCost: false });
+    it("shows nothing when the setting is off", async () => {
+      const { pi } = await boot({ showCost: false });
       const out = render(pi, { ...agent("first", 1000, 0.01), others: [agent("second", 3000, 0.02)] });
 
       expect(out).not.toContain("$");

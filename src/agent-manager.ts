@@ -540,7 +540,7 @@ export class AgentManager {
       parentAgentId: options.parentAgentId,
       workflowId: options.workflowId,
       maxSubagentDepth: options.maxSubagentDepth,
-      rootSessionId: options.rootSessionId,
+      rootSessionId: options.rootSessionId ?? ctx.sessionManager?.getSessionId?.(),
     };
     this.agents.set(id, record);
     // After the insert, so `takenHandles()` already counts this record's own
@@ -1131,6 +1131,8 @@ export class AgentManager {
       // record untouched; the caller decides whether to wait or steer.
       if (record.status === "running" || record.status === "queued") return undefined;
 
+      // A queued continuation has not started a run; do not reuse its predecessor's token.
+      record.abortController = undefined;
       record.isBackground = true;
       record.resultConsumed = false;
       record.result = undefined;

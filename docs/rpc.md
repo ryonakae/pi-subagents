@@ -111,28 +111,37 @@ The same predicate silently scopes the events. **Every lifecycle event is top-le
 
 When a background agent finishes, pi-subagents sends the user a completion notification. If you have already shown the model that result yourself, that notification arrives on top of an answer that was already given, and it costs the parent a turn to dismiss. `subagents:rpc:consume` is how you say you have handled it — the bus-side half of what `get_subagent_result` does when it returns a result.
 
-**When you send it decides whether it works.** In TUI and RPC sessions, the timeline is:
+**Consume before notification delivery.** TUI, RPC, print, and JSON sessions use the same timeline:
 
-1. The agent settles and `subagents:completed` is emitted — `src/index.ts:581`.
-2. Eleven lines later, at `src/index.ts:592`, the code checks `record.resultConsumed` and decides whether to notify at all.
-3. `pi.events` dispatch is synchronous and in-process, so a handler that emits `subagents:rpc:consume` **without awaiting anything** has already set that flag before step 2 evaluates.
+1. The child settles and pi-subagents emits `subagents:completed` or `subagents:failed`.
+2. The completion callback checks `record.resultConsumed` before scheduling a notification. Consumed group members still count toward the group's completion quorum.
+3. Pi's `turn_end` boundary runs after sibling tools finish. The extension filters completed, unconsumed, unnotified runs and proposes `custom_message` drafts with `continue: true`, preserving drafts from preceding handlers. `agent_before_settle` checks again after the final turn and recovery work.
+4. At the next boundary or settlement, the extension checks saved session entries before confirming delivery. If a later handler removed the draft or invalidated the boundary, the result remains pending and can be proposed once more. Each notification gets at most two automatic proposals; further rejection waits for non-extension input. Rejected proposals do not fall through to idle delivery.
+
+Save confirmation uses the existing notification `details` object's identity, which Pi 1.1.0 preserves when appending a custom message entry; no persistent run-token field is added. Extensions copying these drafts should preserve that object. Rewriting a notification's content or replacing its details is outside this contract.
+
+The bus dispatches in-process, so a completion handler that emits `subagents:rpc:consume` before its first `await` sets the consumption flag before step 2.
 
 | When you consume | What happens |
 |---|---|
-| Synchronously, inside your `subagents:completed` handler | The notification is never scheduled. This is the clean path |
-| After an `await`, within 200 ms | Still suppressed. Consumption cancels the held notification, and delivery re-checks `resultConsumed` |
-| After 200 ms, while the parent is busy | Still suppressed. The notification remains inside the extension until `agent_settled`; consumption before delivery prevents it from reaching Pi's follow-up queue |
-| After delivery to Pi | Too late. A follow-up already handed to Pi cannot be withdrawn |
+| Synchronously, inside your `subagents:completed` handler | No notification for this result. Other unread group members can still notify |
+| After an `await`, before our boundary handler proposes it or the idle hold expires | Suppressed. Consumption cancels the held notification, and proposal re-checks `resultConsumed` |
+| After 200 ms, while the parent is busy and no boundary has proposed the result | Suppressed. The notification stays inside the extension rather than entering Pi's steering or follow-up queue |
+| From `get_subagent_result` in the same turn as a parallel sibling tool | Suppressed after both tools finish; unread siblings can still notify at that boundary |
+| In a later boundary handler, after our proposal | Pending retries are cancelled, but the handler must also remove the proposed draft from `event.entries` to suppress that boundary's notification |
+| After boundary commit or an idle wake | Too late. Pi has received the custom message; consume affects only undelivered notifications |
 
-The fork defers delivery, not the lifecycle event or the result itself. `get_subagent_result` can still retrieve a completed result while the parent runs. Individual and grouped notifications use the same hold: a partially consumed group contains only unconsumed results, and a fully consumed group is discarded. Idle parents keep the existing 200 ms hold. Shutdown drops undelivered agent notifications.
+The fork defers delivery, not the lifecycle event or the result. `get_subagent_result` can retrieve a completed result while the parent runs, including after a notification: notification delivery and result consumption are separate states. Boundary delivery bypasses the 200 ms hold and finalizes the spawn debounce, so timers cannot postpone an available completion past one-shot settlement. It leaves running tools and unfinished children alone and retains group join timeouts.
 
-Print (`pi -p`) and JSON hosts retain upstream delivery timing: after 200 ms a completion may already be in Pi's non-retractable follow-up queue, even if the parent is still busy. The fork does not defer these hosts until `agent_settled`, because Pi 0.85.0 can exit before the resulting notification response completes. Consume synchronously or within the hold window to suppress their notifications.
+Pi composes boundary handlers in order. Consume cannot retroactively retract the `entries` already returned by our handler or override another handler's continuation decision. A later consumer owns any draft removal and the continuation it requests; preservation of other extensions' entries remains its responsibility.
+
+Idle parents keep the 200 ms cancellation hold, then the extension appends custom messages and requests one wake for the batch. Normal `agent_settled` bypasses that hold only for unproposed completions arriving after our last boundary handler; Pi awaits the deferred wake before the print host exits. Abort and error outcomes disable wakes until another explicit run; boundary delivery also checks `ctx.signal.aborted` because a tool-execution abort can still have a completed assistant outcome. Held completions remain available for consumption. A synchronous stale-context send failure is dropped without retry, and does not stop other notifications in the idle batch. Session replacement and shutdown clear pending holds, groups, and batch timers, and late completions from the old root session do not notify the new one. A cancelled session switch leaves current-session notifications intact.
 
 Fire-and-forget is the intended use: the reply carries nothing to act on, and the channel sits outside the `subagents:rpc:ping` version handshake on purpose (`src/cross-extension-rpc.ts:190`), so you can send it unconditionally and an older pi-subagents with no handler simply keeps notifying.
 
-Consumption is not terminal. An `@handle` steer un-consumes the record (`src/index.ts:920`) because the agent's reply to that message still needs relaying, and so does a background resume (`src/agent-manager.ts:1135`) because the record is starting a new run.
+Consumption is not terminal. An `@handle` steer un-consumes the record because the agent's reply still needs relaying, and a background resume starts an unconsumed run. Resume removes the predecessor's notification and group membership. The new run receives a fresh abort controller when it starts; a queued resume has no live run token, so stopping it cannot revive the predecessor's result.
 
-One related thing that lives nowhere else: on every top-level settle, pi-subagents writes a session entry — not an event — via `pi.appendEntry("subagents:record", …)` (`src/index.ts:585`), carrying `id`, `type`, `description`, `status`, `result`, `error`, `startedAt` and `completedAt`. It exists for cross-extension history reconstruction. It is append-only history, not something to react to.
+One related thing that lives nowhere else: on a top-level settle in the current root session, pi-subagents writes a session entry — not an event — via `pi.appendEntry("subagents:record", …)`, carrying `id`, `type`, `description`, `status`, `result`, `error`, `startedAt` and `completedAt`. It exists for cross-extension history reconstruction. It is append-only history, not something to react to.
 
 ## The manager registry
 
@@ -175,7 +184,8 @@ This document has no test of its own, so it is worth knowing which claims are ac
 |---|---|---|
 | `test/cross-extension-rpc.test.ts` | Mocked `SpawnCapable` | Envelope shape, per-channel error strings, model resolution and scope enforcement |
 | `test/rpc-lifecycle-gating.test.ts` | Real extension factory | Nothing wired at factory time, everything once at `session_start`, and live widget activity for RPC spawns ([#142](https://github.com/tintinweb/pi-subagents/issues/142)/[#181](https://github.com/tintinweb/pi-subagents/pull/181)) |
-| `test/rpc-result-consumption.test.ts` | Real delivery path | The notification firing, and not firing, around `consume` |
+| `test/rpc-result-consumption.test.ts` | Real extension through tool, RPC, and lifecycle seams | Cancellation around `consume`, group filtering, resume generations, abort/error gating, and session cleanup |
+| `test/notification-boundary-sdk.test.ts` | Real Pi SDK and print host with a scripted provider | Model context and stored notifications at both boundaries, parallel consumption, later draft rejection and RPC consumption, bounded retries, tool-execution aborts, and late settlement before host disposal |
 
 Not pinned anywhere, so treat them as descriptions rather than contracts: the `SpawnOptions.cwd` error strings, `subagents:ready`'s `{}` payload, consume's handle resolution, and its missing `workflowId` check.
 

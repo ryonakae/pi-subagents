@@ -47,7 +47,9 @@ function makePi() {
       return () => handlers.set(event, (handlers.get(event) ?? []).filter(h => h !== handler));
     }),
   };
+  const boundaryNotifications: unknown[] = [];
   const pi = {
+    boundaryNotifications,
     registerMessageRenderer: vi.fn(),
     registerEntryRenderer: vi.fn(),
     registerTool: vi.fn((tool: any) => tools.set(tool.name, tool)),
@@ -56,7 +58,13 @@ function makePi() {
     getFlag: vi.fn(),
     getAllTools: vi.fn(() => [] as any[]),
     setActiveTools: vi.fn(),
-    on: vi.fn((event: string, handler: any) => lifecycle.set(event, handler)),
+    on: vi.fn((event: string, handler: any) => lifecycle.set(event, async (data: any, context: any) => {
+      const result = await handler(data ?? { aborted: false }, context);
+      for (const entry of result?.entries ?? []) {
+        if (entry.customType === "subagent-notification") boundaryNotifications.push([entry]);
+      }
+      return result;
+    })),
     events: bus,
     appendEntry: vi.fn(),
     sendMessage: vi.fn(),
@@ -80,7 +88,7 @@ function ctx(overrides: Record<string, unknown> = {}) {
 }
 
 const notifications = (pi: any): unknown[] =>
-  pi.sendMessage.mock.calls.filter((c: any[]) => c[0]?.customType === "subagent-notification");
+  [...pi.boundaryNotifications, ...pi.sendMessage.mock.calls.filter((c: any[]) => c[0]?.customType === "subagent-notification")];
 
 describe("subagents:rpc:consume", () => {
   let tmpDir: string;
@@ -193,13 +201,26 @@ describe("subagents:rpc:consume", () => {
     );
   }
 
-  it.each(["print", "json"])("delivers after the hold in busy %s mode", async (mode) => {
+  it("appends an unread completion at turn_end without replacing other extension entries", async () => {
+    vi.mocked(runAgent).mockResolvedValue({ responseText: "BOUNDARY_RESULT" } as any);
+    const { pi, bus, lifecycle } = await boot({ isIdle: () => false });
+    await spawnOverRpc(bus, "boundary");
+    const existing = { type: "custom", customType: "other-extension", data: 1 };
+    const result = await lifecycle.get("turn_end")?.({ entries: [existing], continue: false, outcome: "completed" }, ctx());
+
+    expect(result?.entries).toEqual([existing, expect.objectContaining({ type: "custom_message", customType: "subagent-notification", content: expect.stringContaining("BOUNDARY_RESULT") })]);
+    expect(result?.continue).toBe(true);
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it.each(["print", "json"])("keeps busy %s completions cancellable until a boundary", async (mode) => {
     vi.mocked(runAgent).mockResolvedValue({ responseText: "ONE_SHOT_AGENT_OK" } as any);
-    const { pi, bus } = await boot({ mode, isIdle: () => false });
+    const { pi, bus, lifecycle } = await boot({ mode, isIdle: () => false });
 
     await spawnOverRpc(bus, `req-spawn-${mode}`);
     await new Promise(r => setTimeout(r, PAST_THE_HOLD_MS));
-
+    expect(notifications(pi)).toEqual([]);
+    await lifecycle.get("turn_end")({ entries: [], continue: false, outcome: "completed" }, ctx());
     expect(notifications(pi)).toHaveLength(1);
   });
 
@@ -240,7 +261,7 @@ describe("subagents:rpc:consume", () => {
     expect(notifications(pi)).toEqual([]);
   });
 
-  it("delivers an unconsumed held notification exactly once at agent_settled", async () => {
+  it("delivers an unconsumed held notification exactly once at turn_end", async () => {
     vi.mocked(runAgent).mockResolvedValue({ responseText: "UNCONSUMED_AGENT_OK" } as any);
     let idle = false;
     const { pi, bus, lifecycle } = await boot({ isIdle: () => idle });
@@ -248,12 +269,70 @@ describe("subagents:rpc:consume", () => {
     await spawnOverRpc(bus, "req-spawn-unconsumed");
     await new Promise(r => setTimeout(r, PAST_THE_HOLD_MS));
     expect(notifications(pi)).toEqual([]);
-    expect(lifecycle.has("agent_end")).toBe(false);
-    expect(lifecycle.has("turn_end")).toBe(false);
-
+    await lifecycle.get("turn_end")({ entries: [], continue: false, outcome: "completed" }, ctx());
     idle = true;
-    await lifecycle.get("agent_settled")?.();
-    await lifecycle.get("agent_settled")?.();
+    await lifecycle.get("agent_settled")?.({ aborted: false });
+    expect(notifications(pi)).toHaveLength(1);
+  });
+
+  it("picks up a completion at before_settle even while its idle hold is pending", async () => {
+    vi.mocked(runAgent).mockResolvedValue({ responseText: "LATE_RESULT" } as any);
+    const { pi, bus, lifecycle } = await boot({ isIdle: () => false });
+    await spawnOverRpc(bus, "late-before-settle");
+    await lifecycle.get("agent_before_settle")({ entries: [], continue: false, outcome: "completed" }, ctx());
+    expect(notifications(pi)).toHaveLength(1);
+    expect(JSON.stringify(notifications(pi))).toContain("LATE_RESULT");
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it.each(["aborted", "error"])("does not restart a %s parent when a pending timer becomes due after settlement", async outcome => {
+    vi.mocked(runAgent).mockResolvedValue({ responseText: "INTERRUPTED_PARENT_RESULT" } as any);
+    let idle = false;
+    const { pi, bus, lifecycle } = await boot({ isIdle: () => idle });
+    await spawnOverRpc(bus, `interrupted-${outcome}`);
+    const existing = { type: "custom", customType: "other", data: 1 };
+    expect(await lifecycle.get("turn_end")({ entries: [existing], continue: true, outcome }, ctx())).toBeUndefined();
+    expect(await lifecycle.get("agent_before_settle")({ entries: [existing], continue: true, outcome }, ctx())).toBeUndefined();
+    idle = true;
+    await lifecycle.get("agent_settled")({ aborted: outcome === "aborted" });
+    await new Promise(r => setTimeout(r, PAST_THE_HOLD_MS));
+    expect(notifications(pi)).toEqual([]);
+    await lifecycle.get("agent_start")({});
+    await lifecycle.get("turn_end")({ entries: [], continue: false, outcome: "completed" }, ctx());
+    expect(notifications(pi)).toHaveLength(1);
+  });
+
+  it("holds completions that arrive after abort until a new explicit run", async () => {
+    const resolvers = deferredRuns();
+    let idle = false;
+    const { pi, bus, lifecycle } = await boot({ isIdle: () => idle });
+    await spawnOverRpc(bus, "post-abort");
+    idle = true;
+    await lifecycle.get("agent_settled")({ aborted: true });
+    resolvers[0]();
+    await new Promise(r => setTimeout(r, PAST_THE_HOLD_MS));
+    expect(notifications(pi)).toEqual([]);
+    await lifecycle.get("agent_start")({});
+    await lifecycle.get("agent_before_settle")({ entries: [], continue: false, outcome: "completed" }, ctx());
+    expect(notifications(pi)).toHaveLength(1);
+  });
+
+  it("leaves another extension's continuation unchanged when there is no notification", async () => {
+    const { lifecycle } = await boot({ isIdle: () => false });
+    const event = { entries: [{ type: "custom", customType: "other" }], continue: true, outcome: "completed" };
+    expect(await lifecycle.get("turn_end")(event, ctx())).toBeUndefined();
+    expect(event.continue).toBe(true);
+    expect(event.entries).toEqual([{ type: "custom", customType: "other" }]);
+  });
+
+  it("keeps a notified result retrievable without scheduling another notification", async () => {
+    vi.mocked(runAgent).mockResolvedValue({ responseText: "RETRIEVABLE_RESULT" } as any);
+    const { pi, bus, tools, lifecycle } = await boot({ isIdle: () => false });
+    const id = await spawnOverRpc(bus, "retrievable");
+    await lifecycle.get("turn_end")({ entries: [], continue: false, outcome: "completed" }, ctx());
+    const result = await tools.get("get_subagent_result").execute("read-notified", { agent_id: id }, undefined, undefined, ctx());
+    expect(result.content[0].text).toContain("RETRIEVABLE_RESULT");
+    await lifecycle.get("agent_before_settle")({ entries: [], continue: false, outcome: "completed" }, ctx());
     expect(notifications(pi)).toHaveLength(1);
   });
 
@@ -293,6 +372,53 @@ describe("subagents:rpc:consume", () => {
     expect(notifications(pi)).toEqual([]);
   });
 
+  it("keeps the current session usable when a session switch is cancelled", async () => {
+    vi.mocked(runAgent).mockResolvedValue({ responseText: "CURRENT_SESSION_RESULT" } as any);
+    const { pi, bus, lifecycle } = await boot({ isIdle: () => false });
+    await spawnOverRpc(bus, "cancelled-switch");
+    await lifecycle.get("session_before_switch")({}, ctx());
+    // A cancelled switch emits no session_start for a replacement.
+    await lifecycle.get("turn_end")({ entries: [], continue: false, outcome: "completed" }, ctx());
+    expect(notifications(pi)).toHaveLength(1);
+    await spawnOverRpc(bus, "still-current");
+  });
+
+  it("drops pending, batched, and late old-session completions on session replacement", async () => {
+    writeFileSync(join(tmpDir, ".pi", "subagents.json"), JSON.stringify({ schedulingEnabled: false, outputTranscript: false, defaultJoinMode: "group" }));
+    const resolvers = deferredRuns();
+    let sessionId = "s1";
+    const switchingCtx = { isIdle: () => false, sessionManager: { getSessionId: () => sessionId, getBranch: () => [] } };
+    const { pi, tools, bus, lifecycle } = await boot(switchingCtx);
+    await spawnOverTool(tools, "old-batch");
+    await spawnOverRpc(bus, "old-late");
+    resolvers[0]();
+    await Promise.resolve();
+    await lifecycle.get("session_before_switch")({}, ctx());
+    sessionId = "s2";
+    await lifecycle.get("session_start")({}, ctx(switchingCtx));
+    resolvers[1]();
+    await new Promise(r => setTimeout(r, PAST_THE_HOLD_MS));
+    await lifecycle.get("turn_end")({ entries: [], continue: false, outcome: "completed" }, ctx());
+
+    expect(notifications(pi)).toEqual([]);
+  });
+
+  it("discards pending debounce work and late completions on shutdown", async () => {
+    writeFileSync(join(tmpDir, ".pi", "subagents.json"), JSON.stringify({ schedulingEnabled: false, outputTranscript: false, defaultJoinMode: "group" }));
+    const resolvers = deferredRuns();
+    const { pi, tools, lifecycle } = await boot({ isIdle: () => false });
+    await Promise.all([spawnOverTool(tools, "shutdown-first"), spawnOverTool(tools, "shutdown-late")]);
+    resolvers[0]();
+    await Promise.resolve();
+    await shutdown?.();
+    shutdown = undefined;
+    resolvers[1]();
+    await new Promise(r => setTimeout(r, PAST_THE_HOLD_MS));
+    await lifecycle.get("turn_end")({ entries: [], continue: false, outcome: "completed" }, ctx());
+    await lifecycle.get("agent_settled")({ aborted: false });
+    expect(notifications(pi)).toEqual([]);
+  });
+
   it("discards held notifications on shutdown", async () => {
     vi.mocked(runAgent).mockResolvedValue({ responseText: "SHUTDOWN_AGENT_OK" } as any);
     let idle = false;
@@ -306,6 +432,37 @@ describe("subagents:rpc:consume", () => {
     idle = true;
     await lifecycle.get("agent_settled")?.();
     expect(notifications(pi)).toEqual([]);
+  });
+
+  it("groups fast sibling completions at the boundary before debounce and hold expire", async () => {
+    writeFileSync(join(tmpDir, ".pi", "subagents.json"), JSON.stringify({ schedulingEnabled: false, outputTranscript: false, defaultJoinMode: "group" }));
+    vi.mocked(runAgent).mockResolvedValue({ responseText: "FAST_GROUP_RESULT" } as any);
+    const { pi, tools, lifecycle } = await boot({ isIdle: () => false });
+    const ids = await Promise.all([spawnOverTool(tools, "fast-first"), spawnOverTool(tools, "fast-second")]);
+    await lifecycle.get("turn_end")({ entries: [], continue: false, outcome: "completed" }, ctx());
+
+    const sent = notifications(pi);
+    expect(sent).toHaveLength(1);
+    expect(JSON.stringify(sent[0])).toContain(ids[0]);
+    expect(JSON.stringify(sent[0])).toContain(ids[1]);
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("finishes a group whose first member is consumed synchronously on completion", async () => {
+    writeFileSync(join(tmpDir, ".pi", "subagents.json"), JSON.stringify({ schedulingEnabled: false, outputTranscript: false, defaultJoinMode: "group" }));
+    const resolvers = deferredRuns();
+    const { pi, tools, bus, lifecycle } = await boot({ isIdle: () => false });
+    const [first, second] = await Promise.all([spawnOverTool(tools, "sync-first"), spawnOverTool(tools, "sync-second")]);
+    await new Promise(r => setTimeout(r, 150));
+    bus.on("subagents:completed", (data: unknown) => {
+      if ((data as { id: string }).id === first) bus.emit("subagents:rpc:consume", { requestId: "sync-consume", agentId: first });
+    });
+    for (const resolve of resolvers) resolve();
+    await new Promise(r => setTimeout(r, 20));
+    await lifecycle.get("turn_end")({ entries: [], continue: false, outcome: "completed" }, ctx());
+    expect(notifications(pi)).toHaveLength(1);
+    expect(JSON.stringify(notifications(pi))).not.toContain(first);
+    expect(JSON.stringify(notifications(pi))).toContain(second);
   });
 
   it("filters consumed members from a held group notification", async () => {
@@ -406,6 +563,26 @@ describe("subagents:rpc:consume", () => {
     expect(sent).toHaveLength(1);
     expect(JSON.stringify(sent[0])).not.toContain(resumed);
     expect(JSON.stringify(sent[0])).toContain(unread);
+  });
+
+  it("does not revive a consumed run still waiting for its group when a queued resume is stopped", async () => {
+    writeFileSync(join(tmpDir, ".pi", "subagents.json"), JSON.stringify({ schedulingEnabled: false, outputTranscript: false, defaultJoinMode: "group", maxConcurrent: 2 }));
+    const resolvers = deferredRuns();
+    const { pi, tools, bus, lifecycle } = await boot({ isIdle: () => false });
+    const [first, second] = await Promise.all([spawnOverTool(tools, "held-first"), spawnOverTool(tools, "held-second")]);
+    await new Promise(r => setTimeout(r, 150));
+    resolvers[0]();
+    await tools.get("get_subagent_result").execute("consume-held-first", { agent_id: first, wait: true }, undefined, undefined, ctx());
+    await spawnOverRpc(bus, "fill-slot");
+    await resumeOverTool(tools, first, "queued-held-resume");
+    bus.emit("subagents:rpc:stop", { requestId: "stop-held-resume", agentId: first });
+    resolvers[1]();
+    await new Promise(r => setTimeout(r, 20));
+    await lifecycle.get("turn_end")({ entries: [], continue: false, outcome: "completed" }, ctx());
+
+    expect(notifications(pi)).toHaveLength(1);
+    expect(JSON.stringify(notifications(pi))).not.toContain(first);
+    expect(JSON.stringify(notifications(pi))).toContain(second);
   });
 
   it("does not resurrect a fully consumed group and still notifies for the resumed completion", async () => {
@@ -526,16 +703,40 @@ describe("subagents:rpc:consume", () => {
     }
   });
 
+  it("continues an idle batch after a stale send throws without retrying the failed notification", async () => {
+    const resolvers = deferredRuns();
+    let idle = false;
+    const { pi, bus, lifecycle } = await boot({ isIdle: () => idle });
+    await spawnOverRpc(bus, "idle-stale-first");
+    await spawnOverRpc(bus, "idle-stale-second");
+    for (const resolve of resolvers) resolve();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    pi.sendMessage.mockImplementationOnce(() => { throw new Error("stale extension context"); });
+    idle = true;
+
+    await lifecycle.get("agent_settled")({ aborted: false });
+
+    expect(pi.sendMessage).toHaveBeenCalledTimes(2);
+    expect(pi.sendMessage.mock.calls[1][0].content).toContain("GROUP_RESULT_2");
+    expect(pi.sendMessage.mock.calls[1][1]).toEqual({ triggerTurn: true });
+    await lifecycle.get("agent_settled")({ aborted: false });
+    await new Promise(resolve => setTimeout(resolve, PAST_THE_HOLD_MS));
+    expect(pi.sendMessage).toHaveBeenCalledTimes(2);
+  });
+
   it("notifies for an RPC-spawned agent nobody consumed", async () => {
     // The behaviour that makes the notification worth keeping: an unread result
     // is the caller's only signal that the agent finished.
     vi.mocked(runAgent).mockResolvedValue({ responseText: "TASK_EXECUTE_AGENT_OK" } as any);
-    const { pi, bus } = await boot();
+    const { pi, bus, lifecycle } = await boot();
 
     await spawnOverRpc(bus, "req-spawn-1");
     await new Promise(r => setTimeout(r, PAST_THE_HOLD_MS));
+    await lifecycle.get("agent_settled")({ aborted: false });
+    await lifecycle.get("agent_settled")({ aborted: false });
 
     expect(notifications(pi)).toHaveLength(1);
+    expect(pi.sendMessage.mock.calls.filter((call: any[]) => call[1]?.triggerTurn)).toHaveLength(1);
   });
 
   it("suppresses the notification once the caller consumes the result", async () => {

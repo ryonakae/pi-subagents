@@ -137,6 +137,29 @@ describe("GroupJoinManager", () => {
     expect(deliver).toHaveBeenCalledTimes(1);
   });
 
+  it("restarts the full join timeout after the only completed member is removed", () => {
+    const deliver = vi.fn();
+    const mgr = new GroupJoinManager(deliver, 30_000);
+    mgr.registerGroup("g", ["a", "b", "c"]);
+    mgr.onAgentComplete(makeRecord("a"));
+    vi.advanceTimersByTime(10_000);
+
+    mgr.removeAgent("a");
+    vi.advanceTimersByTime(25_000);
+    expect(deliver).not.toHaveBeenCalled();
+    expect(mgr.isGrouped("b")).toBe(true);
+    expect(mgr.isGrouped("c")).toBe(true);
+
+    expect(mgr.onAgentComplete(makeRecord("b"))).toBe("held");
+    vi.advanceTimersByTime(29_999);
+    expect(deliver).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(deliver.mock.calls[0][0].map((record: AgentRecord) => record.id)).toEqual(["b"]);
+    expect(deliver.mock.calls[0][1]).toBe(true);
+    mgr.dispose();
+  });
+
   it("dispose() clears pending timers so a partial delivery never fires post-dispose", () => {
     const deliver = vi.fn();
     const mgr = new GroupJoinManager(deliver, 30_000);

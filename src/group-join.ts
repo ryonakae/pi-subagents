@@ -126,6 +126,26 @@ export class GroupJoinManager {
     this.groups.delete(groupId);
   }
 
+  /** A resumed record must not mutate a completion still waiting for siblings. */
+  removeAgent(agentId: string): void {
+    const groupId = this.agentToGroup.get(agentId);
+    if (!groupId) return;
+    const group = this.groups.get(groupId);
+    this.agentToGroup.delete(agentId);
+    if (!group) return;
+    group.agentIds.delete(agentId);
+    group.completedRecords.delete(agentId);
+    if (group.agentIds.size === 0) {
+      if (group.timeoutHandle) clearTimeout(group.timeoutHandle);
+      this.groups.delete(groupId);
+    } else if (group.completedRecords.size === group.agentIds.size) {
+      this.deliver(group, false);
+    } else if (group.completedRecords.size === 0 && group.timeoutHandle) {
+      clearTimeout(group.timeoutHandle);
+      group.timeoutHandle = undefined;
+    }
+  }
+
   /** Check if an agent is in a group. */
   isGrouped(agentId: string): boolean {
     return this.agentToGroup.has(agentId);

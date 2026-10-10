@@ -12,7 +12,7 @@
 
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
-import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
+import { type BoundaryResult, type BoundaryState, type CustomMessageEntryDraft, defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { abortable } from "./abortable.js";
@@ -446,30 +446,68 @@ export default function (pi: ExtensionAPI) {
   const pendingUsage = new PendingUsagePool();
   // Bound on session_start; read by notification delivery and RPC spawn.
   let currentCtx: ExtensionContext | undefined;
+  let currentSessionId: string | undefined;
 
   // ---- Cancellable pending notifications ----
-  // Agent notifications that come due mid-run stay retractable here until the
-  // parent settles. Workflow notifications retain their existing independent
-  // path and timing.
+  // Busy notifications stay retractable until a safe Pi boundary. Workflow
+  // notifications retain their existing independent path and timing.
   const NUDGE_HOLD_MS = DEFAULT_HOLD_MS;
   // A queued result wait must observe completion before its held notification
   // can fire, so successful waits can still suppress that redundant nudge.
   const QUEUE_WAIT_POLL_MS = Math.floor(NUDGE_HOLD_MS / 4);
+  let wakeAllowed = true;
+  const notifiedRuns = new WeakSet<AbortController>();
+  const notificationRuns = new WeakMap<object, AbortController[]>();
   const agentNudges = new NudgeQueue(
-    () => currentCtx?.mode === "print" || currentCtx?.mode === "json" || (currentCtx?.isIdle() ?? true),
+    () => wakeAllowed && (currentCtx?.isIdle() ?? false),
+    entries => {
+      for (const [index, entry] of entries.entries()) {
+        try {
+          pi.sendMessage(entry, { triggerTurn: index === entries.length - 1 });
+          finishNotification(entry, true);
+        } catch {
+          // A stale send must not block other results or retry indefinitely.
+          finishNotification(entry, false);
+        }
+      }
+    },
     NUDGE_HOLD_MS,
   );
-  const pendingGroupNudges = new Map<string, Map<string, { record: AgentRecord; abortController: AgentRecord["abortController"] }>>();
+  const pendingGroupNudges = new Map<string, Map<string, { record: AgentRecord; abortController: AgentRecord["abortController"]; completedAt: number | undefined }>>();
   const pendingWorkflowNudges = new Map<string, ReturnType<typeof setTimeout>>();
 
-  function scheduleAgentNudge(key: string, send: () => void, delay = NUDGE_HOLD_MS) {
+  function finishNotification(entry: CustomMessageEntryDraft, saved: boolean) {
+    if (entry.details && typeof entry.details === "object") {
+      const runs = notificationRuns.get(entry.details) ?? [];
+      if (saved) for (const run of runs) notifiedRuns.add(run);
+      for (const [key, members] of pendingGroupNudges) {
+        for (const [id, member] of members) {
+          if (member.abortController && runs.includes(member.abortController)) members.delete(id);
+        }
+        if (members.size === 0) pendingGroupNudges.delete(key);
+      }
+    }
+  }
+
+  function confirmNotifications() {
+    let savedDetails: Set<unknown> | undefined;
+    agentNudges.confirm(draft => {
+      savedDetails ??= new Set((currentCtx?.sessionManager.getBranch() ?? [])
+        .flatMap(entry => entry.type === "custom_message" && entry.customType === "subagent-notification" ? [entry.details] : []));
+      if (!savedDetails.has(draft.details)) return false;
+      finishNotification(draft, true);
+      return true;
+    });
+  }
+
+  function scheduleAgentNudge(key: string, send: () => CustomMessageEntryDraft | undefined, delay = NUDGE_HOLD_MS) {
     agentNudges.schedule(key, send, delay);
   }
 
   function cancelAgentNudge(id: string) {
     agentNudges.cancel(id);
-    // Consumption belongs to this notification, not the mutable record: a
-    // queued resume can reset its flags without replacing its controller.
+    // A resume resets the mutable record's flags; remove this notification's
+    // membership so the preceding completion cannot become eligible again.
     for (const [key, members] of pendingGroupNudges) {
       members.delete(id);
       if (members.size === 0) {
@@ -489,25 +527,32 @@ export default function (pi: ExtensionAPI) {
   }
 
   // ---- Individual nudge helper (async join mode) ----
-  function emitIndividualNudge(record: AgentRecord) {
-    if (record.resultConsumed) return;  // re-check at send time
+  function emitIndividualNudge(record: AgentRecord): CustomMessageEntryDraft | undefined {
+    if (record.resultConsumed || record.completedAt === undefined || !record.abortController || notifiedRuns.has(record.abortController)) return;
+    const details = buildNotificationDetails(record, 500, agentActivity.get(record.id));
+    notificationRuns.set(details, [record.abortController]);
 
     const notification = formatTaskNotification(record, 500, showCost);
     const footer = record.outputFile ? `\nFull transcript available at: ${record.outputFile}` : '';
 
-    pi.sendMessage<NotificationDetails>({
+    return {
+      type: "custom_message",
       customType: "subagent-notification",
       content: notification + footer,
       display: true,
-      details: buildNotificationDetails(record, 500, agentActivity.get(record.id)),
-    }, { deliverAs: "followUp", triggerTurn: true });
+      details,
+    };
   }
 
   function sendIndividualNudge(record: AgentRecord) {
     agentActivity.delete(record.id);
     widget.markFinished(record.id);
     fleet.onAgentFinished(record.id);
-    scheduleAgentNudge(record.id, () => emitIndividualNudge(record));
+    const { abortController, completedAt } = record;
+    scheduleAgentNudge(record.id, () => {
+      if (record.abortController !== abortController || record.completedAt !== completedAt) return;
+      return emitIndividualNudge(record);
+    });
     widget.update();
   }
 
@@ -517,20 +562,22 @@ export default function (pi: ExtensionAPI) {
       for (const r of records) { agentActivity.delete(r.id); widget.markFinished(r.id); fleet.onAgentFinished(r.id); }
 
       const groupKey = `group:${records.map(r => r.id).join(",")}`;
-      const completedRuns = new Map(records.map(record => [record.id, { record, abortController: record.abortController }]));
+      const completedRuns = new Map(records.map(record => [record.id, { record, abortController: record.abortController, completedAt: record.completedAt }]));
       pendingGroupNudges.set(groupKey, completedRuns);
       scheduleAgentNudge(groupKey, () => {
-        pendingGroupNudges.delete(groupKey);
         // A resumed agent reuses and mutates its record. Keep this notification
         // tied to the completed run that entered the group, including while a
         // resume is queued before it receives a fresh abort controller.
         const unconsumed = [...completedRuns.values()]
-          .filter(({ record, abortController }) =>
+          .filter(({ record, abortController, completedAt }) =>
             record.abortController === abortController
-            && record.completedAt !== undefined
+            && record.completedAt === completedAt
+            && completedAt !== undefined
+            && abortController !== undefined
+            && !notifiedRuns.has(abortController)
             && !record.resultConsumed)
           .map(({ record }) => record);
-        if (unconsumed.length === 0) { widget.update(); return; }
+        if (unconsumed.length === 0) { pendingGroupNudges.delete(groupKey); widget.update(); return; }
 
         const notifications = unconsumed.map(r => formatTaskNotification(r, 300, showCost)).join('\n\n');
         const label = partial
@@ -543,12 +590,14 @@ export default function (pi: ExtensionAPI) {
           details.others = rest.map(r => buildNotificationDetails(r, 300, agentActivity.get(r.id)));
         }
 
-        pi.sendMessage<NotificationDetails>({
+        notificationRuns.set(details, unconsumed.map(record => record.abortController!));
+        return {
+          type: "custom_message",
           customType: "subagent-notification",
           content: `Background agent group completed: ${label}\n\n${notifications}\n\nUse get_subagent_result for full output.`,
           display: true,
           details,
-        }, { deliverAs: "followUp", triggerTurn: true });
+        };
       });
       widget.update();
     },
@@ -599,7 +648,7 @@ export default function (pi: ExtensionAPI) {
     // owner: the parent's scoped tools, or the workflow's card, notification
     // and dialog. Keep them out of top-level lifecycle, transcript,
     // notification, and UI channels.
-    if (!isTopLevelAgent(record)) return;
+    if (!isTopLevelAgent(record) || !currentCtx || record.rootSessionId !== currentSessionId) return;
 
     // Emit lifecycle event based on terminal status
     const isError = record.status === "error" || record.status === "stopped" || record.status === "aborted";
@@ -619,6 +668,8 @@ export default function (pi: ExtensionAPI) {
 
     // Skip notification if result was already consumed via get_subagent_result
     if (record.resultConsumed) {
+      // Consumption suppresses delivery, not the group's completion quorum.
+      groupJoin.onAgentComplete(record);
       agentActivity.delete(record.id);
       widget.markFinished(record.id);
       fleet.onAgentFinished(record.id);
@@ -815,7 +866,18 @@ export default function (pi: ExtensionAPI) {
   // This also wires the RPC handlers and broadcasts readiness — on the first
   // bound session_start, so a filtered-out activation never advertises (#142).
   pi.on("session_start", async (_event, ctx) => {
+    const sessionId = ctx.sessionManager.getSessionId();
+    if (currentCtx && currentSessionId !== sessionId) {
+      agentNudges.clear();
+      pendingGroupNudges.clear();
+      groupJoin.dispose();
+      if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
+      batchFinalizeTimer = undefined;
+      currentBatchAgents = [];
+    }
     currentCtx = ctx;
+    currentSessionId = sessionId;
+    wakeAllowed = true;
     if (ctx.hasUI) {
       widget.setUICtx(ctx.ui);
       fleet.setUICtx(ctx.ui as any);
@@ -895,6 +957,10 @@ export default function (pi: ExtensionAPI) {
    * notification either way.
    */
   pi.on("input", async (event, ctx) => {
+    if (event.source !== "extension") {
+      confirmNotifications();
+      agentNudges.retry();
+    }
     // Never hijack text the extension layer itself submitted (pi.sendMessage,
     // scheduled prompts) — only something a person typed can be a mention.
     if (event.source === "extension" || !isAgentMentionsEnabled()) return { action: "continue" };
@@ -1115,11 +1181,33 @@ export default function (pi: ExtensionAPI) {
     return { action: "handled" };
   });
 
-  // `agent_end` and `turn_end` may still be followed by retry, compaction, or
-  // another tool-calling turn. Only a fully settled parent may receive held
-  // follow-ups without making them non-retractable in Pi's queue.
-  pi.on("agent_settled", () => {
-    agentNudges.flush();
+  function deliverAtBoundary(event: BoundaryState, ctx: ExtensionContext): BoundaryResult | undefined {
+    confirmNotifications();
+    wakeAllowed = event.outcome === "completed" && !ctx.signal?.aborted;
+    if (!wakeAllowed || !currentCtx) return;
+    if (batchFinalizeTimer) {
+      clearTimeout(batchFinalizeTimer);
+      finalizeBatch();
+    }
+    const entries = agentNudges.propose();
+    if (entries.length === 0) return;
+    return { entries: [...event.entries, ...entries], continue: true };
+  }
+
+  pi.on("agent_start", () => { wakeAllowed = true; });
+  pi.on("turn_end", deliverAtBoundary);
+  pi.on("agent_before_settle", deliverAtBoundary);
+  pi.on("agent_settled", event => {
+    confirmNotifications();
+    if (event.aborted) wakeAllowed = false;
+    if (!wakeAllowed) return;
+    // A later async boundary handler can finish a child after our last proposal.
+    // Pi awaits wakes from agent_settled before a one-shot host disposes.
+    if (batchFinalizeTimer) {
+      clearTimeout(batchFinalizeTimer);
+      finalizeBatch();
+    }
+    agentNudges.flush(true);
   });
 
   pi.on("session_before_switch", () => {
@@ -1136,6 +1224,7 @@ export default function (pi: ExtensionAPI) {
     rpcHandle?.unsubConsume();
     rpcHandle = undefined;
     currentCtx = undefined;
+    currentSessionId = undefined;
     // Only release the global slot if this activation claimed it — a child
     // session's shutdown must not delete the root session's registry entry.
     if (ownsManagerRegistry && (globalThis as any)[MANAGER_KEY] === registryEntry) {
@@ -1147,6 +1236,9 @@ export default function (pi: ExtensionAPI) {
     for (const task of workflowTasks.values()) task.abortController.abort();
     workflowTasks.clear();
     manager.abortAll();
+    if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
+    batchFinalizeTimer = undefined;
+    currentBatchAgents = [];
     groupJoin.dispose();
     agentNudges.dispose();
     pendingGroupNudges.clear();
@@ -1282,10 +1374,11 @@ export default function (pi: ExtensionAPI) {
       // Their onComplete fired but was deferred (agent was in currentBatchAgents),
       // so we feed them into the group now.
       for (const id of ids) {
+        agentNudges.cancel(id);
         const record = manager.getRecord(id);
         if (!record) continue;
         record.groupId = groupId;
-        if (record.completedAt != null && !record.resultConsumed) {
+        if (record.completedAt != null) {
           groupJoin.onAgentComplete(record);
         }
       }
@@ -1320,6 +1413,9 @@ export default function (pi: ExtensionAPI) {
     opts: { outputTranscript: boolean; maxTurns?: number; toolCallId?: string },
   ): Promise<AgentRecord | undefined> {
     const id = existing.id;
+    cancelAgentNudge(id);
+    groupJoin.removeAgent(id);
+    existing.rootSessionId = ctx.sessionManager.getSessionId();
     const joinMode = resolveJoinMode(defaultJoinMode, true);
     // Assigned unconditionally: the completion notification carries this as
     // `<tool-use-id>`, so a mention-resume (which passes none) has to CLEAR the
@@ -2055,6 +2151,8 @@ Terse command-style prompts produce shallow, generic work.
           );
         }
 
+        cancelAgentNudge(existing.id);
+        groupJoin.removeAgent(existing.id);
         const record = await manager.resume(params.resume, params.prompt, signal);
         if (!record) {
           return textResult(`Failed to resume agent "${params.resume}".`);

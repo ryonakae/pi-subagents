@@ -10,6 +10,7 @@ vi.mock("../src/agent-runner.js", async () => {
 
 import { runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
+import { type Hermetic, hermeticDir } from "./helpers/boot-extension.js";
 
 function makePi() {
   const tools = new Map<string, any>();
@@ -48,12 +49,14 @@ function makePi() {
 
 function makeHeadlessCtx() {
   return {
+    mode: "print",
     hasUI: false,
+    isIdle: () => true,
     ui: {
       setStatus: vi.fn(),
       setWidget: vi.fn(),
     },
-    cwd: "/tmp",
+    cwd: process.cwd(),
     model: undefined,
     modelRegistry: {
       find: vi.fn(),
@@ -68,7 +71,15 @@ function makeHeadlessCtx() {
 }
 
 describe("print mode background notifications", () => {
-  afterEach(() => {
+  let hermetic: Hermetic | undefined;
+  let lifecycle: ReturnType<typeof makePi>["handlers"] | undefined;
+
+  afterEach(async () => {
+    await lifecycle?.get("session_shutdown")?.();
+    lifecycle = undefined;
+    delete (globalThis as any)[Symbol.for("pi-subagents:manager")];
+    hermetic?.restore();
+    hermetic = undefined;
     vi.restoreAllMocks();
     vi.useRealTimers();
   });
@@ -81,8 +92,11 @@ describe("print mode background notifications", () => {
       steered: false,
     });
 
+    hermetic = hermeticDir({ settings: { schedulingEnabled: false, outputTranscript: false } });
     const { pi, tools, handlers } = makePi();
+    lifecycle = handlers;
     subagentsExtension(pi);
+    await handlers.get("session_start")({}, makeHeadlessCtx());
     vi.useFakeTimers();
 
     const agentTool = tools.get("Agent");
@@ -104,6 +118,5 @@ describe("print mode background notifications", () => {
 
     expect(pi.sendMessage).toHaveBeenCalled();
 
-    await handlers.get("session_shutdown")?.({}, makeHeadlessCtx());
   });
 });

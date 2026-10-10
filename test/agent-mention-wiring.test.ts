@@ -233,6 +233,7 @@ describe("messaging a finished agent", () => {
     // no tool call behind it, so leaving the spawning call's id on the record
     // would point the orchestrator's new result at a call answered runs ago.
     const { pi, lifecycle, tools } = boot();
+    await lifecycle.get("session_start")({}, ctx());
     finishedRun(fakeSession());
     vi.mocked(resumeAgent).mockResolvedValue({ text: "second answer", failure: undefined } as any);
 
@@ -254,6 +255,7 @@ describe("messaging a finished agent", () => {
     // main model has to be told the answer came back, or the reply is stranded
     // in the agent's transcript.
     const { pi, lifecycle, tools } = boot();
+    await lifecycle.get("session_start")({}, ctx());
     finishedRun(fakeSession());
     vi.mocked(resumeAgent).mockResolvedValue({ text: "second answer", failure: undefined } as any);
 

@@ -47,11 +47,14 @@ const spawn = (tools: Map<string, any>, toolCallId: string | undefined) =>
 
 describe("reporting subagent usage back to the parent session", () => {
   let hermetic: Hermetic;
+  let booted: ReturnType<typeof makePi>["lifecycle"] | undefined;
 
-  function boot(settings: Record<string, unknown>) {
+  async function boot(settings: Record<string, unknown>) {
     hermetic = hermeticDir({ settings });
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
+    booted = lifecycle;
+    await lifecycle.get("session_start")({}, ctx());
     return { pi, tools, lifecycle };
   }
 
@@ -60,14 +63,16 @@ describe("reporting subagent usage back to the parent session", () => {
     vi.mocked(resumeAgent).mockReset();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    await booted?.get("session_shutdown")?.();
+    booted = undefined;
     delete (globalThis as any)[Symbol.for("pi-subagents:manager")];
     registerAgents(new Map());
     hermetic?.restore();
   });
 
   it("attaches a complete pi Usage to the tool result", async () => {
-    const { tools } = boot({ reportUsage: true });
+    const { tools } = await boot({ reportUsage: true });
     runSpending({ input: 100, output: 50, cacheWrite: 10, cacheRead: 900, cost: 0.0123 });
 
     const result = await spawn(tools, "tc-1");
@@ -88,7 +93,7 @@ describe("reporting subagent usage back to the parent session", () => {
   });
 
   it("reports each message's spend exactly once", async () => {
-    const { tools } = boot({ reportUsage: true });
+    const { tools } = await boot({ reportUsage: true });
     runSpending({ input: 100, output: 50, cacheWrite: 10, cost: 0.0123 });
 
     await spawn(tools, "tc-1");
@@ -102,7 +107,7 @@ describe("reporting subagent usage back to the parent session", () => {
   });
 
   it("carries what a later run spends on the later result", async () => {
-    const { tools } = boot({ reportUsage: true });
+    const { tools } = await boot({ reportUsage: true });
     runSpending({ input: 100, output: 50, cacheWrite: 10, cost: 0.01 });
     await spawn(tools, "tc-1");
 
@@ -114,7 +119,7 @@ describe("reporting subagent usage back to the parent session", () => {
   });
 
   it("attaches nothing when the setting is off", async () => {
-    const { tools } = boot({ reportUsage: false });
+    const { tools } = await boot({ reportUsage: false });
     runSpending({ input: 100, output: 50, cacheWrite: 10, cost: 0.0123 });
 
     const result = await spawn(tools, "tc-1");
@@ -126,7 +131,7 @@ describe("reporting subagent usage back to the parent session", () => {
   });
 
   it("defaults to off", async () => {
-    const { tools } = boot({});
+    const { tools } = await boot({});
     runSpending({ input: 100, output: 50, cacheWrite: 10, cost: 0.0123 });
 
     expect((await spawn(tools, "tc-1")).usage).toBeUndefined();
@@ -136,7 +141,7 @@ describe("reporting subagent usage back to the parent session", () => {
     // The `@handle` mention path: a fork of the conversation calls the
     // registered tool with `undefined`, and its session is discarded. Usage hung
     // on that result is spend the user paid for and nobody counted.
-    const { tools } = boot({ reportUsage: true });
+    const { tools } = await boot({ reportUsage: true });
     runSpending({ input: 100, output: 50, cacheWrite: 10, cost: 0.0123 });
 
     const cloned = await spawn(tools, undefined);
@@ -150,14 +155,14 @@ describe("reporting subagent usage back to the parent session", () => {
   });
 
   it("attaches nothing when a run produced no usage at all", async () => {
-    const { tools } = boot({ reportUsage: true });
+    const { tools } = await boot({ reportUsage: true });
     runSpendingNothing();
 
     expect((await spawn(tools, "tc-1")).usage).toBeUndefined();
   });
 
   it("reports an unpriced model's tokens with a zero cost rather than dropping them", async () => {
-    const { tools } = boot({ reportUsage: true });
+    const { tools } = await boot({ reportUsage: true });
     runSpending({ input: 100, output: 50, cacheWrite: 10, cost: 0 });
 
     const result = await spawn(tools, "tc-1");
@@ -170,7 +175,7 @@ describe("reporting subagent usage back to the parent session", () => {
     // Resuming detached is the default since #237, and it runs through a
     // different manager path again — one whose result is an ID, not the spend.
     // The next tool call is what has to carry it.
-    const { pi, tools } = boot({ reportUsage: true });
+    const { pi, tools } = await boot({ reportUsage: true });
     runSpending({ input: 100, output: 50, cacheWrite: 0, cost: 0.01 });
     await spawn(tools, "tc-1");
     await flush();
@@ -205,7 +210,7 @@ describe("reporting subagent usage back to the parent session", () => {
     // somewhere. Anything that summed those records would bill this session
     // twice for one child message — which is why the pool is fed from the
     // manager hook instead.
-    const { pi, tools } = boot({ reportUsage: true });
+    const { pi, tools } = await boot({ reportUsage: true });
     let nested = false;
 
     vi.mocked(runAgent).mockImplementation(async (_c: any, _t: any, _p: any, opts: any) => {
@@ -240,7 +245,7 @@ describe("reporting subagent usage back to the parent session", () => {
     // A resumed agent runs through a different manager path from a spawn, with
     // its own usage wiring. Miss it and every continuation of an agent is free
     // as far as the parent session is concerned.
-    const { pi, tools } = boot({ reportUsage: true });
+    const { pi, tools } = await boot({ reportUsage: true });
     runSpending({ input: 100, output: 50, cacheWrite: 0, cost: 0.01 });
     await spawn(tools, "tc-1");
     await flush();
@@ -274,7 +279,7 @@ describe("reporting subagent usage back to the parent session", () => {
       // payload that carries it takes the whole object. Following it means
       // `usage.cost.total` is where a listener already looks, and whatever pi
       // adds to `Usage` later needs no change here.
-      const { pi, tools } = boot({});
+      const { pi, tools } = await boot({});
       runSpending({ input: 100, output: 50, cacheWrite: 10, cacheRead: 900, cost: 0.0123 });
 
       await spawn(tools, "tc-1");
@@ -292,7 +297,7 @@ describe("reporting subagent usage back to the parent session", () => {
     it("carries it regardless of either setting", async () => {
       // Both settings govern what a human is shown or what the session counts.
       // A listener subscribed to the event asked for the data itself.
-      const { pi, tools } = boot({ reportUsage: false, showCost: false });
+      const { pi, tools } = await boot({ reportUsage: false, showCost: false });
       runSpending({ input: 100, output: 50, cacheWrite: 0, cost: 0.01 });
 
       await spawn(tools, "tc-1");
@@ -304,7 +309,7 @@ describe("reporting subagent usage back to the parent session", () => {
       // The other convention — a flat view model like pi's own SessionStats,
       // excluding cacheRead (#38). It is not derived from `usage` and must not
       // start matching it.
-      const { pi, tools } = boot({});
+      const { pi, tools } = await boot({});
       runSpending({ input: 100, output: 50, cacheWrite: 10, cacheRead: 900, cost: 0.0123 });
 
       await spawn(tools, "tc-1");
@@ -314,7 +319,7 @@ describe("reporting subagent usage back to the parent session", () => {
 
     it("omits usage entirely when nothing was spent", async () => {
       // So a listener can tell "spent nothing" from "never ran".
-      const { pi, tools } = boot({});
+      const { pi, tools } = await boot({});
       runSpendingNothing();
 
       await spawn(tools, "tc-1");
@@ -325,7 +330,7 @@ describe("reporting subagent usage back to the parent session", () => {
     });
 
     it("reports an unpriced model's tokens with a zero cost", async () => {
-      const { pi, tools } = boot({});
+      const { pi, tools } = await boot({});
       runSpending({ input: 100, output: 50, cacheWrite: 0, cost: 0 });
 
       await spawn(tools, "tc-1");
@@ -339,7 +344,7 @@ describe("reporting subagent usage back to the parent session", () => {
   it("reports spend through get_subagent_result too", async () => {
     // Background agents finish with no tool result of their own to ride on;
     // whichever of our tools is called next has to carry them.
-    const { tools } = boot({ reportUsage: true });
+    const { tools } = await boot({ reportUsage: true });
     runSpending({ input: 100, output: 50, cacheWrite: 10, cost: 0.0123 });
 
     await spawn(tools, undefined);   // spend accumulates, nothing attached

@@ -1,117 +1,100 @@
+import type { CustomMessageEntryDraft } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_HOLD_MS, NudgeQueue } from "../src/nudge-queue.js";
+
+const draft = (content: string): CustomMessageEntryDraft => ({ type: "custom_message", customType: "subagent-notification", content, display: true });
 
 describe("NudgeQueue", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
 
   it("delivers once after the hold when idle", () => {
-    const send = vi.fn();
-    const queue = new NudgeQueue(() => true);
-
-    queue.schedule("agent", send);
+    const deliver = vi.fn();
+    const queue = new NudgeQueue(() => true, deliver);
+    queue.schedule("agent", () => draft("result"));
     vi.advanceTimersByTime(DEFAULT_HOLD_MS);
     queue.flush();
-
-    expect(send).toHaveBeenCalledTimes(1);
+    expect(deliver.mock.calls).toEqual([[[draft("result")]]]);
   });
 
-  it("holds a due send while busy and flushes it once after becoming idle", () => {
-    const send = vi.fn();
+  it("keeps busy drafts cancellable and delivers them once after becoming idle", () => {
+    const deliver = vi.fn();
     let idle = false;
-    const queue = new NudgeQueue(() => idle);
-
-    queue.schedule("agent", send);
+    const queue = new NudgeQueue(() => idle, deliver);
+    queue.schedule("agent", () => draft("result"));
     vi.advanceTimersByTime(DEFAULT_HOLD_MS);
     queue.flush();
-    expect(send).not.toHaveBeenCalled();
-
+    expect(deliver).not.toHaveBeenCalled();
     idle = true;
     queue.flush();
     queue.flush();
-    expect(send).toHaveBeenCalledTimes(1);
+    expect(deliver.mock.calls).toEqual([[[draft("result")]]]);
   });
 
-  it("cancels sends both inside the hold and after they become due", () => {
-    const pending = vi.fn();
-    const held = vi.fn();
-    const queue = new NudgeQueue(() => false);
-
-    queue.schedule("pending", pending);
+  it("cancels sends inside the hold and after they become due", () => {
+    const queue = new NudgeQueue(() => false, vi.fn());
+    queue.schedule("pending", () => draft("pending"));
     queue.cancel("pending");
-    queue.schedule("held", held);
+    queue.schedule("due", () => draft("due"));
     vi.advanceTimersByTime(DEFAULT_HOLD_MS);
-    queue.cancel("held");
-    queue.flush();
-
-    expect(pending).not.toHaveBeenCalled();
-    expect(held).not.toHaveBeenCalled();
+    queue.cancel("due");
+    expect(queue.take()).toEqual([]);
   });
 
-  it("replaces an earlier send with the same canonical key", () => {
-    const stale = vi.fn();
-    const current = vi.fn();
-    const queue = new NudgeQueue(() => true);
-
-    queue.schedule("agent", stale);
-    queue.schedule("agent", current);
+  it("replaces an earlier draft with the same canonical key", () => {
+    const deliver = vi.fn();
+    const queue = new NudgeQueue(() => true, deliver);
+    queue.schedule("agent", () => draft("stale"));
+    queue.schedule("agent", () => draft("current"));
     vi.advanceTimersByTime(DEFAULT_HOLD_MS);
-
-    expect(stale).not.toHaveBeenCalled();
-    expect(current).toHaveBeenCalledTimes(1);
+    expect(deliver.mock.calls).toEqual([[[draft("current")]]]);
   });
 
-  it("keeps remaining sends cancellable when delivery makes the parent busy", () => {
-    let idle = false;
-    const first = vi.fn(() => { idle = false; });
-    const second = vi.fn();
-    const queue = new NudgeQueue(() => idle);
-
-    queue.schedule("first", first);
-    queue.schedule("second", second);
+  it("takes pending and due drafts at a boundary without waiting for idle", () => {
+    const deliver = vi.fn();
+    const queue = new NudgeQueue(() => false, deliver);
+    queue.schedule("due", () => draft("due"));
     vi.advanceTimersByTime(DEFAULT_HOLD_MS);
-
-    idle = true;
-    queue.flush();
-    expect(first).toHaveBeenCalledTimes(1);
-    expect(second).not.toHaveBeenCalled();
-
-    queue.cancel("second");
-    idle = true;
-    queue.flush();
-    expect(second).not.toHaveBeenCalled();
+    queue.schedule("pending", () => draft("pending"));
+    expect(queue.take()).toEqual([draft("due"), draft("pending")]);
+    vi.advanceTimersByTime(DEFAULT_HOLD_MS);
+    expect(queue.take()).toEqual([]);
+    expect(deliver).not.toHaveBeenCalled();
   });
 
-  it("continues flushing after a stale send throws", () => {
-    const current = vi.fn();
-    let idle = false;
-    const queue = new NudgeQueue(() => idle);
+  it("filters consumed or stale drafts at delivery", () => {
+    const queue = new NudgeQueue(() => false, vi.fn());
+    queue.schedule("consumed", () => undefined);
+    queue.schedule("current", () => draft("current"));
+    expect(queue.take()).toEqual([draft("current")]);
+  });
 
+  it("continues delivery after a stale builder throws", () => {
+    const queue = new NudgeQueue(() => false, vi.fn());
     queue.schedule("stale", () => { throw new Error("stale session"); });
-    queue.schedule("current", current);
-    vi.advanceTimersByTime(DEFAULT_HOLD_MS);
-
-    idle = true;
-    expect(() => queue.flush()).not.toThrow();
-    expect(current).toHaveBeenCalledTimes(1);
+    queue.schedule("current", () => draft("current"));
+    expect(queue.take()).toEqual([draft("current")]);
   });
 
-  it("drops pending and held sends on dispose and rejects later schedules", () => {
-    const held = vi.fn();
-    const pending = vi.fn();
-    const afterDispose = vi.fn();
-    const queue = new NudgeQueue(() => false);
+  it("clears a replaced session without disabling the next session", () => {
+    const queue = new NudgeQueue(() => false, vi.fn());
+    queue.schedule("old", () => draft("old"));
+    queue.clear();
+    queue.schedule("new", () => draft("new"));
+    expect(queue.take()).toEqual([draft("new")]);
+  });
 
-    queue.schedule("held", held);
+  it("drops pending and due drafts on dispose and rejects later schedules", () => {
+    const deliver = vi.fn();
+    const queue = new NudgeQueue(() => false, deliver);
+    queue.schedule("due", () => draft("due"));
     vi.advanceTimersByTime(DEFAULT_HOLD_MS);
-    queue.schedule("pending", pending);
+    queue.schedule("pending", () => draft("pending"));
     queue.dispose();
-    queue.schedule("later", afterDispose);
+    queue.schedule("later", () => draft("later"));
     vi.advanceTimersByTime(DEFAULT_HOLD_MS * 2);
     queue.flush();
-
-    expect(held).not.toHaveBeenCalled();
-    expect(pending).not.toHaveBeenCalled();
-    expect(afterDispose).not.toHaveBeenCalled();
+    expect(queue.take()).toEqual([]);
+    expect(deliver).not.toHaveBeenCalled();
   });
 });

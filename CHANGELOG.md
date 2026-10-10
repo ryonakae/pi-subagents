@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Subagent prompts include shared task-completion instructions in append and replace modes.** They ask the child to finish the delegated task or report a concrete blocker, reserve the final answer for that outcome, and respect explicit stops and runtime limits. This is a prompt instruction, not a guarantee of model behavior.
+
 ### Fixed
+- **Unread child completions reach the parent at Pi's safe turn boundaries.** Busy parents receive cancellable `custom_message` proposals at `turn_end` or `agent_before_settle`, including in print and JSON modes, without interrupting sibling tools. Delivery is confirmed from saved entries; a rejected draft gets one automatic retry, not an unbounded continuation loop. Normal settlement collects late completions before print-host disposal, while tool-execution aborts do not inject notifications or restart the parent. Consumption cancels pending results, partially consumed groups retain unread members, and resume removes old results and empty join timers. Idle delivery keeps its 200 ms hold, stale sends do not block the batch, and session replacement or shutdown drops stale completions.
 - **The FleetView list no longer sits flush against pi's footer** (fixes [#351](https://github.com/tintinweb/pi-subagents/issues/351) — thanks [@KKinsz](https://github.com/KKinsz)). pi places below-editor widgets directly on its status bar with no gap, so the last agent row ran into the model/context line. The list now ends with a blank line, matching the one above `main`.
 - **FleetView arrow keys work when another extension replaces the prompt editor** (fixes [#374](https://github.com/tintinweb/pi-subagents/issues/374) — thanks [@BarrMan](https://github.com/BarrMan)). The list only handled keys while an `Editor` subclass had focus, so an editor installed via `ui.setEditorComponent` that implements pi's `EditorComponent` interface without extending `Editor` (e.g. pi-voice-stt's) left `↓`/`←` dead. The list now recognizes any focused component with `getText`/`setText`, lifting the limitation noted in the #123 fix; pi's own dialogs and selectors still keep their keys.
 

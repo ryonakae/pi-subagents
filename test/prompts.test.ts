@@ -33,6 +33,23 @@ describe("buildAgentPrompt", () => {
     expect(prompt).toContain("darwin");
   });
 
+  it.each(["append", "replace"] as const)("requires completion or a concrete blocker in %s mode", (promptMode) => {
+    const config = { ...getDefaultConfig("general-purpose"), promptMode };
+    const prompt = buildAgentPrompt(config, "/workspace", env, "Parent prompt.");
+    expect(prompt).toContain("Work until the assigned completion criteria are met");
+    expect(prompt).toContain("a concrete blocker prevents safe continuation");
+    expect(prompt).toContain("Do not use a final answer for a progress update or an offer to continue");
+    expect(prompt).toContain("Respect explicit stop requests and runtime limits");
+  });
+
+  it.each(["append", "replace"] as const)("keeps the original assignment after supplemental steering in %s mode", (promptMode) => {
+    const config = { ...getDefaultConfig("general-purpose"), promptMode };
+    const prompt = buildAgentPrompt(config, "/workspace", env, "Parent prompt.", { workflowChild: true });
+    expect(prompt).toContain("Steering messages supplement the assignment unless they explicitly replace or cancel it");
+    expect(prompt).toContain("After addressing an additional question, continue the remaining original work");
+    expect(prompt).toContain("Your final message IS the return value");
+  });
+
   it("handles non-git repos", () => {
     const config = getDefaultConfig("Explore");
     const prompt = buildAgentPrompt(config, "/workspace", envNoGit);
