@@ -834,7 +834,7 @@ describe("AgentManager — isolation: worktree fails loud, no silent fallback", 
 
   it("a foreground spawn surfaces the same failure by rejecting spawnAndWait", async () => {
     // The other half of the strict contract: the top-level Agent tool awaits
-    // this call, and pi only marks a tool result failed when execute throws.
+    // this call and reports failure by letting the throw out of execute.
     const { createWorktree } = await import("../src/worktree.js");
     vi.mocked(createWorktree).mockResolvedValueOnce(undefined);
     vi.mocked(runAgent).mockClear();
@@ -847,6 +847,31 @@ describe("AgentManager — isolation: worktree fails loud, no silent fallback", 
 
     expect(manager.listAgents()).toEqual([]);
     expect(runAgent).not.toHaveBeenCalled();
+  });
+
+  it("a QUEUED foreground spawn rejects spawnAndWait too, not just the immediate one (#179)", async () => {
+    // A queued start fails at drain time, when nobody awaits `startups`, so the
+    // failure lands on the record. spawnAndWait must still throw it — otherwise
+    // queue pressure decides whether the Agent tool call is marked failed.
+    const { createWorktree } = await import("../src/worktree.js");
+    vi.mocked(createWorktree).mockResolvedValueOnce(undefined);
+    let resolveRun!: (v: unknown) => void;
+    vi.mocked(runAgent).mockClear();
+    vi.mocked(runAgent).mockImplementationOnce(() => new Promise((res) => { resolveRun = res as (v: unknown) => void; }));
+
+    manager = new AgentManager();
+    manager.setMaxConcurrentForeground(1);
+    const blocker = manager.spawnAndWait(mockPi, mockCtx, "general-purpose", "blocker", { description: "blocker" });
+    const queued = manager.spawnAndWait(mockPi, mockCtx, "general-purpose", "test", {
+      description: "test",
+      isolation: "worktree",
+    });
+    expect(manager.listAgents().find(r => r.description === "test")?.status).toBe("queued");
+
+    resolveRun({ responseText: "done", session: mockSession(), aborted: false, steered: false });
+    await blocker;
+    await expect(queued).rejects.toThrow(/isolation: "worktree"/);
+    expect(runAgent).toHaveBeenCalledTimes(1);
   });
 
   it("keeps the concurrency slot accounting straight while the worktree is being created", async () => {

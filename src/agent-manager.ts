@@ -1080,10 +1080,10 @@ export class AgentManager {
     // The run promise only exists once startup is past its awaited repo copy —
     // without this the call would return before the agent had started at all.
     // A startup failure (strict worktree isolation) rejects here, which is what
-    // the immediate path owes its caller: pi only marks a tool result failed
-    // when `execute` throws. A queued spawn's failure landed on the record
-    // instead (nobody was awaiting `startups` at drain time) and is rethrown
-    // below, so the contract is the same either way.
+    // the immediate path owes its caller: the Agent tool reports failure by
+    // letting this throw out of `execute`. A queued spawn's failure landed on
+    // the record instead (nobody was awaiting `startups` at drain time) and is
+    // rethrown below, so the contract is the same either way.
     await this.awaitStartup(id);
 
     // undefined when it was aborted while queued, or stopped mid-copy, and so
